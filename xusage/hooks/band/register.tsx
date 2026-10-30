@@ -24,10 +24,167 @@ const PLAN_TTL_MS = 300_000
 const RATE_LIMIT_TTL_MS = 300_000
 const MAX_RATE_LIMIT_TTL_MS = 3_600_000
 
+let windowsHost: boolean | undefined
+const onWindows = async ($: EngineInterface) =>
+  (windowsHost ??= (await $.env.get('OS').catch(() => undefined)) === 'Windows_NT')
+
+// A Windows session started from Git Bash carries an MSYS HOME (/c/Users/...), which no Windows path API resolves.
 const home = async ($: EngineInterface) =>
-  (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+  (await onWindows($))
+    ? (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+    : (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
 const claudeDir = async ($: EngineInterface) =>
   (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${await home($)}/.claude`
+
+// Windows has none of the Unix tools this module runs, so every use goes through the helpers below: cmd.exe for
+// mkdir/rmdir/move, $.fs for a file the host reads whole, and PowerShell only for a file too large for $.fs.read.
+const TAIL_BYTES = 262_144
+const READ_LIMIT = 4 * 1024 * 1024
+
+const system32 = async ($: EngineInterface) => `${(await $.env.get('SystemRoot')) ?? 'C:\\Windows'}\\System32`
+
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+// -EncodedCommand takes UTF-16LE base64, which sidesteps every layer of Windows argument quoting.
+function utf16Base64(text: string): string {
+  const bytes: number[] = []
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    bytes.push(code & 255, code >> 8)
+  }
+  let out = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0)
+    out += BASE64[(n >> 18) & 63] + BASE64[(n >> 12) & 63] +
+      (i + 1 < bytes.length ? BASE64[(n >> 6) & 63] : '=') + (i + 2 < bytes.length ? BASE64[n & 63] : '=')
+  }
+  return out
+}
+
+// PowerShell also closes a single-quoted string on the typographic quotes.
+const psLiteral = (value: string) => `'${value.replace(/['\u2018\u2019\u201a\u201b]/g, quote => quote + quote)}'`
+
+async function powershell($: EngineInterface, script: string) {
+  return await $.process
+    .run([
+      `${await system32($)}\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-EncodedCommand', utf16Base64(`$ErrorActionPreference='Stop'\n${script}`),
+    ])
+    .catch(() => undefined)
+}
+
+// mkdir fails on an existing directory and rmdir on a non-empty one, which is what the cache lock relies on.
+async function fileOp($: EngineInterface, op: 'mkdir' | 'rmdir' | 'move', ...paths: string[]): Promise<boolean> {
+  if (!(await onWindows($))) {
+    const run = await $.process.run([op === 'move' ? '/bin/mv' : `/bin/${op}`, ...paths]).catch(() => undefined)
+    return run?.exitCode === 0
+  }
+  const native = paths.map(p => p.replace(/\//g, '\\'))
+  // cmd.exe expands or splits these even inside an argument; PowerShell takes the path as a literal.
+  if (native.some(p => /[%!^&|<>(),;=]/.test(p))) {
+    const [from, to] = native.map(psLiteral)
+    const script = op === 'mkdir'
+      ? `New-Item -ItemType Directory -Path ${from} | Out-Null`
+      : op === 'rmdir'
+        ? `[IO.Directory]::Delete(${from})`
+        : `Move-Item -LiteralPath ${from} -Destination ${to} -Force`
+    return (await powershell($, script))?.exitCode === 0
+  }
+  const run = await $.process
+    .run([`${await system32($)}\\cmd.exe`, '/d', '/c', ...(op === 'move' ? ['move', '/y'] : [op]), ...native])
+    .catch(() => undefined)
+  return run?.exitCode === 0
+}
+
+// A session transcript runs to tens of MB and is read every few seconds, so a PowerShell read is kept until the
+// file changes. Finished agents are never read again, so only the most recently used reads are kept.
+const LARGE_READS = 32
+const largeReads = new Map<string, { size: number; mtimeMs: number; value: string | undefined }>()
+
+async function windowsRead(
+  $: EngineInterface,
+  path: string,
+  cut: (text: string) => string,
+  script: string,
+): Promise<string | undefined> {
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat === undefined) return undefined
+  if (stat.size <= READ_LIMIT) {
+    const text = await $.fs.read(path).catch(() => undefined)
+    if (text !== undefined) return cut(text)
+  }
+  const key = `${path}\n${script}`
+  const held = largeReads.get(key)
+  // Re-inserted on every hit, so the Map's first key is the least recently used.
+  largeReads.delete(key)
+  if (held !== undefined && held.size === stat.size && held.mtimeMs === stat.mtimeMs) {
+    largeReads.set(key, held)
+    return held.value
+  }
+  // Shared for writing too: Claude Code may hold the transcript open while it appends.
+  const run = await powershell($, [
+    `$s=[IO.File]::Open(${psLiteral(path)},'Open','Read','ReadWrite, Delete')`,
+    '$o=[Console]::OpenStandardOutput()',
+    '$e=New-Object Text.UTF8Encoding($false)',
+    'function emit($v){$b=$e.GetBytes($v+[char]10);$o.Write($b,0,$b.Length)}',
+    script,
+    '$o.Flush();$s.Close()',
+  ].join('\n'))
+  const value = run?.exitCode === 0 ? run.stdout : undefined
+  largeReads.set(key, { size: stat.size, mtimeMs: stat.mtimeMs, value })
+  if (largeReads.size > LARGE_READS) largeReads.delete(largeReads.keys().next().value!)
+  return value
+}
+
+/** The last 256 KB of a file, or undefined when it cannot be read. */
+async function tailText($: EngineInterface, path: string): Promise<string | undefined> {
+  if (!(await onWindows($))) {
+    const out = await $.process.run(['/usr/bin/tail', '-c', String(TAIL_BYTES), path]).catch(() => undefined)
+    return out?.exitCode === 0 ? out.stdout : undefined
+  }
+  return await windowsRead($, path, text => text.slice(-TAIL_BYTES), [
+    `$n=[Math]::Min($s.Length,${TAIL_BYTES});[void]$s.Seek(-$n,'End')`,
+    '$b=New-Object byte[] $n;$r=0',
+    'while($r -lt $n){$k=$s.Read($b,$r,$n-$r);if($k -le 0){break};$r+=$k}',
+    '$o.Write($b,0,$r)',
+  ].join('\n'))
+}
+
+async function headLine($: EngineInterface, path: string): Promise<string | undefined> {
+  if (!(await onWindows($))) {
+    const out = await $.process.run(['/usr/bin/head', '-n', '1', path]).catch(() => undefined)
+    return out?.exitCode === 0 ? out.stdout : undefined
+  }
+  return await windowsRead($, path, text => text.split('\n', 1)[0], [
+    '$t=New-Object IO.StreamReader($s,[Text.Encoding]::UTF8)',
+    '$l=$t.ReadLine();if($l -ne $null){emit $l}',
+  ].join('\n'))
+}
+
+/**
+ * grep: the lines matching `pattern` (an ERE), or with `only` each match on its own line; '' for no match,
+ * undefined when the file cannot be read.
+ */
+async function grepFile($: EngineInterface, path: string, pattern: string, only = false): Promise<string | undefined> {
+  if (!(await onWindows($))) {
+    const out = await $.process.run(['/usr/bin/grep', only ? '-o' : '-E', pattern, path]).catch(() => undefined)
+    return out === undefined || out.exitCode > 1 ? undefined : out.stdout
+  }
+  const cut = (text: string) => {
+    const re = new RegExp(pattern, only ? 'g' : '')
+    const lines = text.split('\n')
+    const hits = only ? lines.flatMap(line => [...line.matchAll(re)].map(m => m[0])) : lines.filter(line => re.test(line))
+    return hits.map(line => `${line}\n`).join('')
+  }
+  return await windowsRead($, path, cut, [
+    '$t=New-Object IO.StreamReader($s,[Text.Encoding]::UTF8)',
+    `$re=[regex]${psLiteral(pattern)}`,
+    only
+      ? 'while(($l=$t.ReadLine()) -ne $null){foreach($m in $re.Matches($l)){emit $m.Value}}'
+      : 'while(($l=$t.ReadLine()) -ne $null){if($re.IsMatch($l)){emit $l}}',
+  ].join('\n'))
+}
 
 // Absent flag = shown, same convention as ponytail's band.
 async function hidden($: EngineInterface): Promise<boolean> {
@@ -92,11 +249,17 @@ async function proxyUsage($: EngineInterface): Promise<Usage> {
   } catch {
     override = undefined
   }
+  const windows = await onWindows($)
+  const appData = windows ? await $.env.get('APPDATA') : undefined
   const candidates = [
     override,
-    `${await home($)}/Library/Application Support/com.cpa.gui/usage-records/usage.db`,
+    windows
+      ? appData && `${appData}/com.cpa.gui/usage-records/usage.db`
+      : `${await home($)}/Library/Application Support/com.cpa.gui/usage-records/usage.db`,
     `${await home($)}/.cli-proxy-api/usage.db`,
   ].filter((p): p is string => typeof p === 'string' && p !== '')
+  // Windows ships no sqlite3, so it has to be on PATH there.
+  const sqlite = windows ? 'sqlite3' : '/usr/bin/sqlite3'
 
   const sql = [
     'select',
@@ -115,7 +278,7 @@ async function proxyUsage($: EngineInterface): Promise<Usage> {
   let lastError = 'proxy database not found'
   for (const db of candidates) {
     const run = await $.process
-      .run(['/usr/bin/sqlite3', '-json', '-cmd', '.timeout 2000', db, sql])
+      .run([sqlite, '-json', '-cmd', '.timeout 2000', db, sql])
       .catch(() => undefined)
     if (run === undefined) {
       lastError = 'sqlite3 unavailable'
@@ -172,9 +335,12 @@ function planLabel(plan: unknown, tier: unknown): string {
 }
 
 async function claudeToken($: EngineInterface): Promise<{ token: string; plan: string } | undefined> {
-  const raw = await $.process
-    .run(['/usr/bin/security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'])
-    .catch(() => undefined)
+  // Claude Code keeps the Windows credentials in the file alone.
+  const raw = (await onWindows($))
+    ? undefined
+    : await $.process
+      .run(['/usr/bin/security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'])
+      .catch(() => undefined)
   if (raw !== undefined && raw.exitCode === 0 && raw.stdout.trim() !== '') {
     try {
       const creds = JSON.parse(raw.stdout)
@@ -301,17 +467,13 @@ async function readCache($: EngineInterface, path: string): Promise<Cache | unde
 async function writeCache($: EngineInterface, path: string, entry: Cache): Promise<void> {
   const temporary = `${path}.${crypto.randomUUID()}.tmp`
   await $.fs.write(temporary, JSON.stringify(entry))
-  const moved = await $.process.run(['/bin/mv', temporary, path])
-  if (moved.exitCode !== 0) throw new Error('usage cache write failed')
+  if (!(await fileOp($, 'move', temporary, path))) throw new Error('usage cache write failed')
 }
 
 async function acquireLock($: EngineInterface, path: string, now: number): Promise<boolean> {
   const modified = (await $.fs.stat(path).catch(() => undefined))?.mtimeMs
-  if (modified !== undefined && now - modified > 30_000) {
-    await $.process.run(['/bin/rmdir', path]).catch(() => undefined)
-  }
-  const result = await $.process.run(['/bin/mkdir', path]).catch(() => undefined)
-  return result?.exitCode === 0
+  if (modified !== undefined && now - modified > 30_000) await fileOp($, 'rmdir', path)
+  return await fileOp($, 'mkdir', path)
 }
 
 async function usage($: EngineInterface): Promise<Usage> {
@@ -358,7 +520,7 @@ async function usage($: EngineInterface): Promise<Usage> {
       await writeCache($, path, cache)
       return cachedValue
     } finally {
-      await $.process.run(['/bin/rmdir', lock]).catch(() => undefined)
+      await fileOp($, 'rmdir', lock)
     }
   })()
   try {
@@ -451,9 +613,12 @@ async function sessionDir($: EngineInterface): Promise<string> {
   const session = await $.session.id()
   if (sessionDirCache?.session === session) return sessionDirCache.dir
   const projects = `${await claudeDir($)}/projects`
-  const encoded = `${projects}/${(await $.session.cwd()).replace(/[^a-zA-Z0-9]/g, '-')}/${session}`
-  let dir = encoded
+  // root, not cwd: a shell cd moves cwd but never the session's project folder.
+  const start = await $.session.root().catch(() => $.session.cwd())
+  const encoded = `${projects}/${start.replace(/[^a-zA-Z0-9]/g, '-')}/${session}`
+  let dir: string | undefined = encoded
   if (!(await $.fs.exists(encoded).catch(() => false))) {
+    dir = undefined
     for (const p of await $.fs.list(projects).catch(() => [])) {
       const candidate = `${projects}/${p.name}/${session}`
       if (await $.fs.exists(candidate).catch(() => false)) {
@@ -462,6 +627,8 @@ async function sessionDir($: EngineInterface): Promise<string> {
       }
     }
   }
+  // A folder not there yet is looked up again next time instead of being held for the whole session.
+  if (dir === undefined) return encoded
   sessionDirCache = { session, dir }
   return dir
 }
@@ -512,9 +679,9 @@ async function workflowInfo(
 
 // The meta file is rewritten when an agent finishes, so the spawn time comes from the transcript's first line.
 async function agentStart($: EngineInterface, path: string): Promise<number> {
-  const out = await $.process.run(['/usr/bin/head', '-n', '1', path]).catch(() => undefined)
-  if (out === undefined || out.exitCode !== 0) return 0
-  const match = out.stdout.match(/"timestamp":"([^"]+)"/)
+  const line = await headLine($, path)
+  if (line === undefined) return 0
+  const match = line.match(/"timestamp":"([^"]+)"/)
   const ms = match === null ? Number.NaN : Date.parse(match[1])
   return Number.isNaN(ms) ? 0 : ms
 }
@@ -530,10 +697,13 @@ async function taskIdMap($: EngineInterface, dir: string, names: readonly string
   const now = await $.clock.now()
   if (taskIds !== undefined && now - taskIds.at < TASK_SCAN_MS) return taskIds.map
   const map = taskIds?.map ?? new Map<string, string>()
-  const found = await $.process
-    .run(['/usr/bin/grep', '-o', '"taskId":"[^"]*","taskType":"local_workflow"[^}]*"runId":"[^"]*"', `${dir}.jsonl`])
-    .catch(() => undefined)
-  for (const line of (found?.stdout ?? '').split('\n')) {
+  const found = await grepFile(
+    $,
+    `${dir}.jsonl`,
+    '"taskId":"[^"]*","taskType":"local_workflow"[^}]*"runId":"[^"]*"',
+    true,
+  ).catch(() => undefined)
+  for (const line of (found ?? '').split('\n')) {
     const pair = /^"taskId":"([^"]+)".*"runId":"([^"]+)"$/.exec(line)
     if (pair !== null) map.set(pair[2], pair[1])
   }
@@ -541,20 +711,38 @@ async function taskIdMap($: EngineInterface, dir: string, names: readonly string
   return map
 }
 
-async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
-  const now = await $.clock.now()
-  if (workflows !== undefined && now - workflows.at < 3_000) return workflows.list
-  const dir = await sessionDir($)
+// The run dirs holding a .jsonl written within STALE_MS.
+async function recentRuns($: EngineInterface, dir: string, now: number): Promise<Set<string>> {
+  const root = `${dir}/subagents/workflows`
+  if (await onWindows($)) {
+    // No find: one listing per run dir, which carries each file's mtime without a stat.
+    const names = new Set<string>()
+    for (const run of await $.fs.list(root).catch(() => [])) {
+      if (run.kind !== 'dir') continue
+      const files = await $.fs.list(`${root}/${run.name}`).catch(() => [])
+      if (files.some(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= STALE_MS)) {
+        names.add(run.name)
+      }
+    }
+    return names
+  }
   // One find instead of a stat per run dir: a session accumulates hundreds of finished runs.
   const recent = await $.process
-    .run(['/usr/bin/find', `${dir}/subagents/workflows`, '-mindepth', '2', '-maxdepth', '2', '-name', '*.jsonl', '-mmin', `-${STALE_MS / 60_000}`])
+    .run(['/usr/bin/find', root, '-mindepth', '2', '-maxdepth', '2', '-name', '*.jsonl', '-mmin', `-${STALE_MS / 60_000}`])
     .catch(() => undefined)
-  const names = new Set(
+  return new Set(
     (recent?.stdout ?? '').split('\n').flatMap(path => {
       const parts = path.split('/')
       return parts.length < 2 ? [] : [parts[parts.length - 2]]
     }),
   )
+}
+
+async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
+  const now = await $.clock.now()
+  if (workflows !== undefined && now - workflows.at < 3_000) return workflows.list
+  const dir = await sessionDir($)
+  const names = await recentRuns($, dir, now)
   const list: WorkflowRun[] = []
   for (const name of names) {
     const root = `${dir}/subagents/workflows/${name}`
@@ -577,11 +765,11 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     if (now - at > STALE_MS) continue
     // Result lines carry the agent's whole output, so only their keys are read; started/failed lines are small and
     // read in journal order, since a failed attempt may be retried under the same key.
-    const events = await $.process.run(['/usr/bin/grep', '-E', '"type":"(started|failed)"', journal]).catch(() => undefined)
-    const results = await $.process.run(['/usr/bin/grep', '-o', '"type":"result","key":"[^"]*"', journal]).catch(() => undefined)
-    if (events === undefined || events.exitCode > 1) continue
+    const events = await grepFile($, journal, '"type":"(started|failed)"').catch(() => undefined)
+    const results = await grepFile($, journal, '"type":"result","key":"[^"]*"', true).catch(() => undefined)
+    if (events === undefined) continue
     const done = new Set(
-      (results?.stdout ?? '').split('\n').flatMap(line => {
+      (results ?? '').split('\n').flatMap(line => {
         const at = line.indexOf('"key":"')
         return at < 0 ? [] : [line.slice(at + 7, -1)]
       }),
@@ -589,7 +777,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     // A retried key is logged as started more than once; keep one row, for its latest attempt, until its result arrives.
     const pending = new Map<string, { label: string; phase: string; agentId: string }>()
     const failed = new Set<string>()
-    for (const line of events.stdout.split('\n')) {
+    for (const line of events.split('\n')) {
       if (line === '') continue
       try {
         const row = JSON.parse(line)
@@ -644,9 +832,9 @@ const mtime = async ($: EngineInterface, path: string) =>
 
 async function transcriptTime($: EngineInterface, path: string): Promise<number> {
   // A window of the tail, not the whole (tens of MB) transcript.
-  const out = await $.process.run(['/usr/bin/tail', '-c', '262144', path]).catch(() => undefined)
-  if (out === undefined || out.exitCode !== 0) return 0
-  const stamps = [...out.stdout.matchAll(/"timestamp":"([^"]+)"/g)]
+  const out = await tailText($, path)
+  if (out === undefined) return 0
+  const stamps = [...out.matchAll(/"timestamp":"([^"]+)"/g)]
   const last = stamps[stamps.length - 1]
   const ms = last === undefined ? Number.NaN : Date.parse(last[1])
   return Number.isNaN(ms) ? 0 : ms
@@ -656,9 +844,9 @@ async function transcriptTime($: EngineInterface, path: string): Promise<number>
 // input side, i.e. the context the agent carries now, not the summed spend. Read the tail backwards.
 // shortcut: a tail window smaller than the last tool result yields no model or tokens.
 async function agentUsage($: EngineInterface, path: string): Promise<{ model: string; tokens: number | undefined }> {
-  const out = await $.process.run(['/usr/bin/tail', '-c', '262144', path]).catch(() => undefined)
-  if (out === undefined || out.exitCode !== 0) return { model: '', tokens: undefined }
-  const lines = out.stdout.split('\n')
+  const out = await tailText($, path)
+  if (out === undefined) return { model: '', tokens: undefined }
+  const lines = out.split('\n')
   let model: string | undefined
   let tokens: number | undefined
   for (let i = lines.length - 1; i >= 0 && (model === undefined || tokens === undefined); i -= 1) {

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,7 +16,7 @@ async function loadModule() {
   const js = new Bun.Transpiler({
     loader: 'tsx',
     tsconfig: JSON.stringify({ compilerOptions: { jsx: 'react', jsxFactory: 'h' } }),
-  }).transformSync(`${source}\nexport { usage };`)
+  }).transformSync(`${source}\nexport { usage, tailText, headLine, grepFile };`)
   const url = `data:text/javascript;base64,${Buffer.from(`${js}\n// ${crypto.randomUUID()}`).toString('base64')}`
   return await import(url)
 }
@@ -42,15 +42,20 @@ function engine(
       get: async (name: string) => {
         if (name === 'USAGE_BAND_SOURCE') return 'claude'
         if (name === 'CLAUDE_CONFIG_DIR') return root
+        // The module picks its Windows paths from these.
+        if (name === 'OS' || name === 'SystemRoot') return process.env[name]
         return undefined
       },
     },
     fs: {
-      read: async (path: string) => await Bun.file(path).text(),
+      // Windows has no Keychain, so the module reads the credentials file there.
+      read: async (path: string) => path.endsWith('.credentials.json')
+        ? JSON.stringify({ claudeAiOauth: { accessToken: 'test-token', ...oauth } })
+        : await Bun.file(path).text(),
       write: async (path: string, text: string) => { await Bun.write(path, text) },
       stat: async (path: string) => {
         const stat = await import('node:fs/promises').then(fs => fs.stat(path))
-        return { mtimeMs: stat.mtimeMs }
+        return { size: stat.size, mtimeMs: stat.mtimeMs }
       },
     },
     process: {
@@ -228,6 +233,44 @@ test('recovers a stale cache lock left by a closed window', async () => {
   expect(env.calls()).toBe(1)
 })
 
+test('takes the cache lock under a path with spaces and shell metacharacters', async () => {
+  const usage = await loadUsage()
+  const root = mkdtempSync(join(tmpdir(), "xusage test & (it's) %x%-"))
+  const env = engine(async () => ok(12), root)
+
+  expect((await usage(env.$)).windows[0].used).toBe(12)
+  expect(existsSync(join(root, 'xusage-cache.json'))).toBe(true)
+  expect(existsSync(join(root, 'xusage-cache.json.lock'))).toBe(false)
+})
+
+// Over $.fs.read's 4 MiB cap, the Windows build reads through PowerShell instead of the host.
+test('reads the head, tail and matches of a file over 4 MiB', async () => {
+  const { tailText, headLine, grepFile } = await loadModule()
+  const env = engine(async () => ok(12))
+  const path = join(env.root, 'big.jsonl')
+  const filler = `${JSON.stringify({ type: 'progress', text: 'x'.repeat(1000) })}\n`
+  await Bun.write(
+    path,
+    [
+      `${JSON.stringify({ type: 'user', timestamp: '2026-10-30T01:00:00.000Z', text: 'xin chào' })}\n`,
+      `${JSON.stringify({ type: 'started', key: 'k1' })}\n`,
+      filler.repeat(4500),
+      `${JSON.stringify({ type: 'result', key: 'k1' })}\n`,
+      `${JSON.stringify({ type: 'assistant', timestamp: '2026-10-30T02:00:00.000Z' })}\n`,
+    ].join(''),
+  )
+
+  expect(await headLine(env.$, path)).toContain('"timestamp":"2026-10-30T01:00:00.000Z"')
+  expect(await headLine(env.$, path)).toContain('xin chào')
+  const tail = await tailText(env.$, path)
+  expect(tail.length).toBeLessThanOrEqual(262_144)
+  expect(tail).toEndWith('"timestamp":"2026-10-30T02:00:00.000Z"}\n')
+  expect(await grepFile(env.$, path, '"type":"(started|failed)"')).toBe(`${JSON.stringify({ type: 'started', key: 'k1' })}\n`)
+  expect(await grepFile(env.$, path, '"type":"result","key":"[^"]*"', true)).toBe('"type":"result","key":"k1"\n')
+  expect(await grepFile(env.$, path, '"type":"missing"')).toBe('')
+  expect(await tailText(env.$, join(env.root, 'absent.jsonl'))).toBeUndefined()
+})
+
 test('renders compact usage labels without retry errors', async () => {
   const { register } = await loadModule()
   const oauth = { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' }
@@ -256,7 +299,8 @@ test('renders compact usage labels without retry errors', async () => {
     agent: { list: async () => [] },
     fs: {
       ...env.$.fs,
-      read: async (path: string) => path === join(env.root, 'settings.json')
+      // The module joins with '/', which join() spells '\' on Windows.
+      read: async (path: string) => path.replace(/\\/g, '/') === `${env.root.replace(/\\/g, '/')}/settings.json`
         ? JSON.stringify(settings)
         : env.$.fs.read(path),
       list: async () => [],
@@ -440,10 +484,11 @@ test('titles a running workflow with its script meta and names it by task id', a
       list: async (path: string) =>
         readdirSync(path, { withFileTypes: true }).map(entry => ({
           name: entry.name,
-          kind: entry.isDirectory() ? 'directory' : 'file',
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
         })),
     },
-    session: { id: async () => session, cwd: async () => '/tmp/work' },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
     ui: {
       resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
       close: async () => undefined,
@@ -557,10 +602,11 @@ test('hides a finished background agent that the engine still reports as waiting
       list: async (path: string) =>
         readdirSync(path, { withFileTypes: true }).map(entry => ({
           name: entry.name,
-          kind: entry.isDirectory() ? 'directory' : 'file',
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
         })),
     },
-    session: { id: async () => session, cwd: async () => '/tmp/work' },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
     ui: {
       resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
       close: async () => undefined,
