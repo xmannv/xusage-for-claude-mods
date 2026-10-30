@@ -68,14 +68,23 @@ git clone https://github.com/xmannv/xusage-for-claude-mods.git
 cp -R xusage-for-claude-mods/xusage ~/.claude/skills/xusage
 ```
 
+On Windows (PowerShell):
+
+```powershell
+git clone https://github.com/xmannv/xusage-for-claude-mods.git
+Copy-Item -Recurse xusage-for-claude-mods\xusage "$env:USERPROFILE\.claude\skills\xusage"
+```
+
 Restart Claude Code. Modules load once per window, so an already-running session keeps the old code until it is reloaded.
 
 ### Requirements
 
 - A Claude Code build with module support (the band/pane `modules` API).
-- macOS or Linux. The module invokes Unix absolute paths (`/usr/bin/security`, `/usr/bin/sqlite3`, `/bin/mv`, `/bin/mkdir`, `/bin/rmdir`, `/usr/bin/grep`, `/usr/bin/tail`, `/usr/bin/head`, `/usr/bin/find`); Windows is not supported.
-- Claude account mode prefers the macOS Keychain item `Claude Code-credentials` and falls back to `$CLAUDE_CONFIG_DIR/.credentials.json` (`~/.claude` by default).
-- Proxy mode needs `/usr/bin/sqlite3` (built into macOS; install the `sqlite3` package on Linux).
+- macOS, Linux or Windows.
+  - macOS / Linux: the module invokes Unix absolute paths (`/usr/bin/security`, `/usr/bin/sqlite3`, `/bin/mv`, `/bin/mkdir`, `/bin/rmdir`, `/usr/bin/grep`, `/usr/bin/tail`, `/usr/bin/head`, `/usr/bin/find`).
+  - Windows (detected from `OS=Windows_NT`): nothing to install. File locks and the cache rename go through `%SystemRoot%\System32\cmd.exe`; transcripts and journals are read through the host when they are 4 MiB or smaller, and through Windows PowerShell 5.1 (built in) when larger, with the result kept until the file changes. The home directory comes from `USERPROFILE`, so an MSYS `HOME` set by Git Bash does not misplace `.claude`.
+- Claude account mode prefers the macOS Keychain item `Claude Code-credentials` and falls back to `$CLAUDE_CONFIG_DIR/.credentials.json` (`~/.claude` by default). On Windows and Linux only the file is read.
+- Proxy mode needs `sqlite3`: `/usr/bin/sqlite3` on macOS (built in) and Linux (the `sqlite3` package); on Windows `sqlite3.exe` on `PATH` (e.g. `winget install SQLite.SQLite`).
 
 ## Configuration
 
@@ -88,13 +97,13 @@ Restart Claude Code. Modules load once per window, so an already-running session
 
 Proxy database defaults:
 
-1. `~/Library/Application Support/com.cpa.gui/usage-records/usage.db`
+1. `~/Library/Application Support/com.cpa.gui/usage-records/usage.db` (Windows: `%APPDATA%\com.cpa.gui\usage-records\usage.db`)
 2. `~/.cli-proxy-api/usage.db`
 
 ## Where the data comes from
 
 - **Claude account** — `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from the macOS Keychain or `$CLAUDE_CONFIG_DIR/.credentials.json`. The plan comes from `subscriptionType` + `rateLimitTier`.
-- **Local proxy** — the newest EasyCLIProxyAPI usage record, which carries the upstream quota headers (`X-Codex-*`). The band reads it with `/usr/bin/sqlite3`.
+- **Local proxy** — the newest EasyCLIProxyAPI usage record, which carries the upstream quota headers (`X-Codex-*`). The band reads it with `sqlite3`.
 - **Agents and workflows** — Claude Code does not expose workflows through the plugin API, so the band reads the session's own files under `$CLAUDE_CONFIG_DIR/projects/<project>/<session>/`: `subagents/agent-*.jsonl` (+ `.meta.json`), `subagents/workflows/<run>/journal.jsonl`, `subagents/workflows/<run>/agent-*.jsonl`, `workflows/<run>.json`, `workflows/scripts/*.js` and the session transcript `<session>.jsonl` (for task ids).
 
 Usage is cached across all Claude Code windows through a lock file, so simultaneous windows make one request instead of one each. A `429` without `Retry-After` backs off 5 minutes; a valid `Retry-After` (seconds or HTTP date) is honored, capped at 1 hour.
