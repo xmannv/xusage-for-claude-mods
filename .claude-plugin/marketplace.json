@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "xusage-for-claude-mods",
+  "description": "Plan quota, context and agent activity for Claude Code mods.",
+  "owner": {
+    "name": "Xman",
+    "email": "admin@user.vn"
+  },
+  "plugins": [
+    {
+      "name": "xusage",
+      "source": "./xusage",
+      "description": "Band above the prompt with plan usage, quota resets, context and running agents/workflows.",
+      "category": "productivity",
+      "author": {
+        "name": "Xman",
+        "email": "admin@user.vn"
+      }
+    }
+  ]
+}
