@@ -588,7 +588,15 @@ type WorkflowRun = {
   title: string
   startedAt: number
   at: number
-  agents: { label: string; phase: string; model: string; tokens: number | undefined }[]
+  // The journal records only the spawn event; the agent's own transcript carries its start and last write.
+  agents: {
+    label: string
+    phase: string
+    model: string
+    tokens: number | undefined
+    startedAt: number
+    at: number
+  }[]
   done: number
   failed: number
 }
@@ -797,8 +805,15 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     }
     const agents: WorkflowRun['agents'] = []
     for (const { agentId, ...a } of pending.values()) {
-      const usage = agentId === '' ? undefined : await agentUsage($, `${root}/agent-${agentId}.jsonl`)
-      agents.push({ ...a, model: usage?.model ?? '', tokens: usage?.tokens })
+      const path = agentId === '' ? undefined : `${root}/agent-${agentId}.jsonl`
+      const usage = path === undefined ? undefined : await agentUsage($, path)
+      agents.push({
+        ...a,
+        model: usage?.model ?? '',
+        tokens: usage?.tokens,
+        startedAt: path === undefined ? 0 : await agentStart($, path),
+        at: path === undefined ? 0 : await mtime($, path),
+      })
     }
     const info = await workflowInfo($, dir, name)
     list.push({
@@ -1175,8 +1190,12 @@ export const register: Register = on => {
                   {' · '}
                   {a.status}
                   {tokenText.get(a.id) ?? ''}
-                  {span === '' ? '' : ` · ${span}`}
                 </Text>
+                {span !== '' && (
+                  <Text dimColor wrap="truncate-end">
+                    {span}
+                  </Text>
+                )}
               </Box>
             )
           })
@@ -1197,18 +1216,26 @@ export const register: Register = on => {
                     {w.task ?? w.id} · {progress(w)}
                     {span === '' ? '' : ` · ${span}`}
                   </Text>
-                  {w.agents.map((a, i) => (
-                    <Text key={`${w.id}-${i}`} wrap="truncate-end">
-                      <Text dimColor>{'- '}</Text>
-                      <Text bold>{a.label}</Text>
-                      <Text dimColor>
-                        {[a.model, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
-                          .filter(Boolean)
-                          .map(part => ` · ${part}`)
-                          .join('')}
-                      </Text>
-                    </Text>
-                  ))}
+                  {w.agents.map((a, i) => {
+                    const agentSpan = timeline(a.startedAt, a.at)
+                    return (
+                      <Box key={`${w.id}-${i}`} flexDirection="column">
+                        <Text wrap="truncate-end">
+                          <Text dimColor>{'- '}</Text>
+                          <Text bold>{a.label}</Text>
+                          <Text dimColor>
+                            {[a.model, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
+                              .filter(Boolean)
+                              .map(part => ` · ${part}`)
+                              .join('')}
+                          </Text>
+                        </Text>
+                        {agentSpan !== '' && (
+                          <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
+                        )}
+                      </Box>
+                    )
+                  })}
                 </Box>
               )
             })}

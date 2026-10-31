@@ -33,7 +33,7 @@ Claude Code's built-in agent UI does not cover background work well:
 - **Badge** — `1 wf · 1 agent` in the band, counting live direct agents plus the agents currently running inside workflows. Click it to open the pane; if a pane cannot be placed, a condensed summary is shown as a toast.
 - **Direct agents** — every live running or waiting subagent and teammate of the session: name, id, kind, model, status, tokens, start time and last activity.
 - **Finished agents disappear** — a background agent that Claude has finished is hidden even though the engine still reports it as `waiting`.
-- **Running workflows** — the title comes from the workflow script's own description; the id is the **task id the conversation uses** (e.g. `wft7bs6ek`) when its launch result is found, otherwise the internal run id. Each run shows its progress, start time and last activity, and each agent currently running inside it shows label, model, phase and tokens.
+- **Running workflows** — the title comes from the workflow script's own description; the id is the **task id the conversation uses** (e.g. `wft7bs6ek`) when its launch result is found, otherwise the internal run id. Each run shows its progress, start time and last activity, and each agent currently running inside it shows its label, model, phase, tokens, start time and last activity, read from that agent's own transcript.
 - **Activity age** — the band always shows when the conversation last did something, using the newest transcript, agent or workflow file, so a conversation that looks idle but has background agents running is visibly alive.
 
 **Agents pane** — opened by clicking the `N wf · M agents` badge.

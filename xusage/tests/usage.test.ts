@@ -405,6 +405,7 @@ test('titles a running workflow with its script meta and names it by task id', a
       join(root, 'agent-a1.jsonl'),
       `${JSON.stringify({
         type: 'assistant',
+        timestamp: new Date(Date.now() - 305_000).toISOString(),
         message: { model: 'claude-opus-5', usage: { input_tokens: 1, cache_read_input_tokens: 49_999 } },
       })}\n`,
     )
@@ -531,12 +532,13 @@ test('titles a running workflow with its script meta and names it by task id', a
     const wfBox = find(rendered, 'wf_abc')
     expect(text(wfBox.children[0])).toBe('S3 test-gap round 2 + review, then S4 -> S8')
     expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · activity: now')
-    expect(text(find(rendered, 'wf_abc-0'))).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
+    const wfAgent = find(rendered, 'wf_abc-0')
+    expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
+    expect(text(wfAgent.children[1])).toBe('  started: 5m · activity: 5m ago')
     const agentBox = find(rendered, 'b2')
     expect(text(agentBox.children[0])).toBe('Implement top-up bonus rate')
-    expect(text(agentBox.children[1])).toBe(
-      'b2 · subagent · claude-opus-5-5 · running · 130k tokens · started: 5m · activity: now',
-    )
+    expect(text(agentBox.children[1])).toBe('b2 · subagent · claude-opus-5-5 · running · 130k tokens')
+    expect(text(agentBox.children[2])).toBe('started: 5m · activity: now')
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
     expect(text(rendered)).toContain('started: 5m · activity: now')
