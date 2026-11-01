@@ -943,6 +943,9 @@ const BG_SCAN_MS = 30_000
 const BG_RECENT_MS = 120_000
 const BG_GRACE_MS = 10_000
 const BG_KEEP_MS = 24 * 60 * 60_000
+// A launch from a previous supervisor cannot still be running after a restart; without a terminal record it
+// would only resurface as a stale row the user cannot act on.
+const BOOT_MS = Date.now()
 const BG_PROBE_MAX = 64
 const BG_ANCHOR = '"run_in_background":true|Command running in background with ID:|<task-id>|"name":"TaskStop"'
 const BG_LAUNCH =
@@ -1213,7 +1216,10 @@ async function bgBuild($: EngineInterface, state: BgState, now: number): Promise
         : probed === 'dead'
           ? 'stale'
           : 'unknown'
-    if ((status === 'stale' || status === 'unknown') && now - Math.max(task.at, task.startedAt) > BG_KEEP_MS) continue
+    if (status === 'stale' || status === 'unknown') {
+      if (task.startedAt < BOOT_MS) continue
+      if (now - Math.max(task.at, task.startedAt) > BG_KEEP_MS) continue
+    }
     list.push({ ...task, status })
   }
   list.sort((a, b) => BG_RANK[a.status] - BG_RANK[b.status] || b.startedAt - a.startedAt)

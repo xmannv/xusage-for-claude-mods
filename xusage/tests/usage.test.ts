@@ -551,21 +551,23 @@ test('titles a running workflow with its script meta and names it by task id', a
 
 test('shows background tasks and marks a dead silent one stale', async () => {
   const { register } = await loadModule()
+  const boot = Date.now()
   const env = engine(async () => ok(12))
   const session = 'sess-bg'
   const dir = join(env.root, 'projects', '-tmp-work', session)
   mkdirSync(join(dir, 'subagents'), { recursive: true })
   const tasks = join(env.root, 'bg-tasks')
   mkdirSync(tasks, { recursive: true })
-  const now = env.now()
-  const output = async (id: string) => {
+  const now = boot + 30_000
+  const output = async (id: string, at = now) => {
     const path = join(tasks, `${id}.output`)
     await Bun.write(path, 'out')
-    utimesSync(path, new Date(now), new Date(now))
+    utimesSync(path, new Date(at), new Date(at))
     return path
   }
   const livePath = await output('blive123')
   const subPath = await output('bsub123')
+  const oldPath = await output('bpre1234', boot - 7_200_000)
   const launch = (tool: string, id: string, path: string, at: number, label: string) => [
     JSON.stringify({
       type: 'assistant',
@@ -594,11 +596,12 @@ test('shows background tasks and marks a dead silent one stale', async () => {
   await Bun.write(
     `${dir}.jsonl`,
     [
-      launch('tu1', 'blive123', livePath, now - 120_000, 'Run lanes per class'),
-      launch('tu2', 'bstale12', join(tasks, 'bstale12.output'), now - 7_200_000, 'One-off cleanup'),
-      launch('tu3', 'bnotif12', livePath, now - 60_000, 'Already done'),
-      launch('tu4', 'bstop123', livePath, now - 60_000, 'Stopped by model'),
-      launch('tu5', 'bold1234', join(tasks, 'bold1234.output'), now - 90_000_000, 'Ancient task'),
+      launch('tu1', 'blive123', livePath, boot, 'Run lanes per class'),
+      launch('tu2', 'bstale12', join(tasks, 'bstale12.output'), boot, 'One-off cleanup'),
+      launch('tu3', 'bnotif12', livePath, boot, 'Already done'),
+      launch('tu4', 'bstop123', livePath, boot, 'Stopped by model'),
+      launch('tu5', 'bpre1234', oldPath, boot - 7_200_000, 'Previous process'),
+      launch('tu6', 'bold1234', join(tasks, 'bold1234.output'), boot - 90_000_000, 'Ancient task'),
       JSON.stringify({
         type: 'queue-operation',
         content: '<task-notification>\n<task-id>bnotif12</task-id>\n<status>completed</status>\n</task-notification>',
@@ -611,7 +614,7 @@ test('shows background tasks and marks a dead silent one stale', async () => {
   )
   await Bun.write(
     join(dir, 'subagents', 'agent-sub1.jsonl'),
-    `${launch('tu6', 'bsub123', subPath, now - 60_000, 'Subagent bg')}\n`,
+    `${launch('tu7', 'bsub123', subPath, boot, 'Subagent bg')}\n`,
   )
   let pane: any
   let band: any
@@ -627,6 +630,7 @@ test('shows background tasks and marks a dead silent one stale', async () => {
   globalThis.setInterval = (() => 1) as any
   const $ = {
     ...env.$,
+    clock: { now: async () => now },
     process: {
       run: async (command: string[]) => command[0].endsWith('/lsof')
         ? {
@@ -693,13 +697,14 @@ test('shows background tasks and marks a dead silent one stale', async () => {
     expect(text(rendered)).toContain('Subagent bg')
     const live = find(rendered, 'bg-blive123')
     expect(text(live.children[0])).toBe('Run lanes per class')
-    expect(text(live.children[1])).toBe('blive123 · started: 2m · activity: now · running')
+    expect(text(live.children[1])).toBe('blive123 · started: 30s · activity: now · running')
     const stale = find(rendered, 'bg-bstale12')
-    expect(text(stale.children[1])).toBe('bstale12 · started: 2h · stale')
+    expect(text(stale.children[1])).toBe('bstale12 · started: 30s · stale')
     const sub = find(rendered, 'bg-bsub123')
-    expect(text(sub.children[1])).toBe('bsub123 · started: 1m · activity: now · running')
+    expect(text(sub.children[1])).toBe('bsub123 · started: 30s · activity: now · running')
     expect(text(rendered)).not.toContain('Already done')
     expect(text(rendered)).not.toContain('Stopped by model')
+    expect(text(rendered)).not.toContain('Previous process')
     expect(text(rendered)).not.toContain('Ancient task')
     const bar = await band($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
     expect(text(bar)).toContain('2 bg · 1 stale')
@@ -711,13 +716,14 @@ test('shows background tasks and marks a dead silent one stale', async () => {
 
 test('marks a background task unverified when liveness cannot be probed', async () => {
   const { register } = await loadModule()
+  const boot = Date.now()
   const env = engine(async () => ok(12))
   const session = 'sess-bg-unknown'
   const dir = join(env.root, 'projects', '-tmp-work', session)
   mkdirSync(dir, { recursive: true })
   const tasks = join(env.root, 'bg-unknown')
   mkdirSync(tasks, { recursive: true })
-  const now = env.now()
+  const now = boot + 30_000
   const path = join(tasks, 'bunkn123.output')
   await Bun.write(path, 'out')
   utimesSync(path, new Date(now), new Date(now))
@@ -726,7 +732,7 @@ test('marks a background task unverified when liveness cannot be probed', async 
     [
       JSON.stringify({
         type: 'assistant',
-        timestamp: new Date(now - 180_000).toISOString(),
+        timestamp: new Date(boot).toISOString(),
         message: {
           content: [{
             type: 'tool_use',
@@ -738,7 +744,7 @@ test('marks a background task unverified when liveness cannot be probed', async 
       }),
       JSON.stringify({
         type: 'user',
-        timestamp: new Date(now - 180_000).toISOString(),
+        timestamp: new Date(boot).toISOString(),
         message: {
           content: [{
             type: 'tool_result',
@@ -761,6 +767,7 @@ test('marks a background task unverified when liveness cannot be probed', async 
   globalThis.setInterval = (() => 1) as any
   const $ = {
     ...env.$,
+    clock: { now: async () => now },
     process: {
       run: async (command: string[]) => command[0].endsWith('/lsof')
         ? { exitCode: 2, stdout: '', stderr: 'lsof failed' }
@@ -798,7 +805,7 @@ test('marks a background task unverified when liveness cannot be probed', async 
   try {
     const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
     expect(text(rendered)).toContain('Background (1)')
-    expect(text(rendered)).toContain('bunkn123 · started: 3m · activity: now · unverified')
+    expect(text(rendered)).toContain('bunkn123 · started: 30s · activity: now · unverified')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
