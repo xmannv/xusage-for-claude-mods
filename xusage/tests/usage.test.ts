@@ -435,7 +435,7 @@ test('titles a running workflow with its script meta and names it by task id', a
     [
       JSON.stringify({
         type: 'assistant',
-        timestamp: new Date(Date.now() - 305_000).toISOString(),
+        timestamp: new Date(Date.now() - 4_830_000).toISOString(),
         message: { model: 'claude-opus-5-5', usage: { input_tokens: 10, cache_read_input_tokens: 1_000, output_tokens: 5 } },
       }),
       JSON.stringify({
@@ -538,10 +538,10 @@ test('titles a running workflow with its script meta and names it by task id', a
     const agentBox = find(rendered, 'b2')
     expect(text(agentBox.children[0])).toBe('Implement top-up bonus rate')
     expect(text(agentBox.children[1])).toBe('b2 · subagent · claude-opus-5-5 · running · 130k tokens')
-    expect(text(agentBox.children[2])).toBe('started: 5m · activity: now')
+    expect(text(agentBox.children[2])).toBe('started: 1h20m · activity: now')
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
-    expect(text(rendered)).toContain('started: 5m · activity: now')
+    expect(text(rendered)).toContain('started: 1h20m · activity: now')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval

@@ -904,11 +904,18 @@ async function lastActivity($: EngineInterface, runs: WorkflowRun[]): Promise<Ac
 function ago(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
   if (seconds < 5) return 'now'
-  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
-  return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`
+  if (hours >= 24) return `${Math.floor(hours / 24)}d`
+  const rest = minutes % 60
+  return rest === 0 ? `${hours}h` : `${hours}h${rest}m`
+}
+
+const activityText = (ms: number) => {
+  const value = ago(ms)
+  return value === 'now' ? value : `${value} ago`
 }
 
 const tone = (used: number) => (used >= 90 ? 'error' : used >= 70 ? 'warning' : undefined)
@@ -1123,7 +1130,7 @@ export const register: Register = on => {
             </Button>
           )}
         </Box>
-        {act !== undefined && act.at > 0 && <Text dimColor>activity: {ago(now - act.at)}</Text>}
+        {act !== undefined && act.at > 0 && <Text dimColor>activity: {activityText(now - act.at)}</Text>}
       </Box>
     )
   }).catch(($, e, next) => next(e))
@@ -1159,8 +1166,8 @@ export const register: Register = on => {
     }
     const timeline = (started: number | undefined, at: number | undefined) =>
       [
-        started !== undefined && started > 0 ? `started: ${ago(now - started).replace(' ago', '')}` : '',
-        at !== undefined && at > 0 ? `activity: ${ago(now - at)}` : '',
+        started !== undefined && started > 0 ? `started: ${ago(now - started)}` : '',
+        at !== undefined && at > 0 ? `activity: ${activityText(now - at)}` : '',
       ]
         .filter(Boolean)
         .join(' · ')
