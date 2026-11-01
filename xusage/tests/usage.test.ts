@@ -535,6 +535,7 @@ test('titles a running workflow with its script meta and names it by task id', a
     const wfAgent = find(rendered, 'wf_abc-0')
     expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
     expect(text(wfAgent.children[1])).toBe('  started: 5m · activity: 5m ago')
+    expect(text(rendered)).toContain('Agents (1)')
     const agentBox = find(rendered, 'b2')
     expect(text(agentBox.children[0])).toBe('Implement top-up bonus rate')
     expect(text(agentBox.children[1])).toBe('b2 · subagent · claude-opus-5-5 · running · 130k tokens')
@@ -542,6 +543,262 @@ test('titles a running workflow with its script meta and names it by task id', a
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
     expect(text(rendered)).toContain('started: 1h20m · activity: now')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
+
+test('shows background tasks and marks a dead silent one stale', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(join(dir, 'subagents'), { recursive: true })
+  const tasks = join(env.root, 'bg-tasks')
+  mkdirSync(tasks, { recursive: true })
+  const now = env.now()
+  const output = async (id: string) => {
+    const path = join(tasks, `${id}.output`)
+    await Bun.write(path, 'out')
+    utimesSync(path, new Date(now), new Date(now))
+    return path
+  }
+  const livePath = await output('blive123')
+  const subPath = await output('bsub123')
+  const launch = (tool: string, id: string, path: string, at: number, label: string) => [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(at).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: tool,
+          name: 'Bash',
+          input: { command: 'bash run-lanes.sh', description: label, run_in_background: true },
+        }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: new Date(at).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_result',
+          tool_use_id: tool,
+          content: `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`,
+        }],
+      },
+    }),
+  ].join('\n')
+  await Bun.write(
+    `${dir}.jsonl`,
+    [
+      launch('tu1', 'blive123', livePath, now - 120_000, 'Run lanes per class'),
+      launch('tu2', 'bstale12', join(tasks, 'bstale12.output'), now - 7_200_000, 'One-off cleanup'),
+      launch('tu3', 'bnotif12', livePath, now - 60_000, 'Already done'),
+      launch('tu4', 'bstop123', livePath, now - 60_000, 'Stopped by model'),
+      launch('tu5', 'bold1234', join(tasks, 'bold1234.output'), now - 90_000_000, 'Ancient task'),
+      JSON.stringify({
+        type: 'queue-operation',
+        content: '<task-notification>\n<task-id>bnotif12</task-id>\n<status>completed</status>\n</task-notification>',
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'tu9', name: 'TaskStop', input: { task_id: 'bstop123' } }] },
+      }),
+    ].join('\n') + '\n',
+  )
+  await Bun.write(
+    join(dir, 'subagents', 'agent-sub1.jsonl'),
+    `${launch('tu6', 'bsub123', subPath, now - 60_000, 'Subagent bg')}\n`,
+  )
+  let pane: any
+  let band: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    if (filter.component === 'AbovePrompt') band = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    process: {
+      run: async (command: string[]) => command[0].endsWith('/lsof')
+        ? {
+          exitCode: 0,
+          stdout: [livePath, subPath].map((path, i) => `p${i + 1}\nf1\nn${path}`).join('\n'),
+          stderr: '',
+        }
+        : env.$.process.run(command),
+    },
+    agent: { list: async () => [] },
+    fs: {
+      ...env.$.fs,
+      stat: async (path: string) => path === '/usr/sbin/lsof' || path === '/usr/bin/lsof'
+        ? { size: 1, mtimeMs: 0 }
+        : env.$.fs.stat(path),
+      exists: async (path: string) => existsSync(path),
+      list: async (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: {
+      id: async () => session,
+      root: async () => '/tmp/work',
+      cwd: async () => '/tmp/work/sub',
+      usage: async () => ({ context: { tokens: 42_000, window: 258_000 } }),
+    },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+  const find = (node: any, key: string): any => {
+    if (node == null || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = find(child, key)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (node.props?.key === key) return node
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      const hit = find(child, key)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+
+  try {
+    const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
+    expect(text(rendered)).toContain('Background (3)')
+    expect(text(rendered)).toContain('Run lanes per class')
+    expect(text(rendered)).toContain('Subagent bg')
+    const live = find(rendered, 'bg-blive123')
+    expect(text(live.children[0])).toBe('Run lanes per class')
+    expect(text(live.children[1])).toBe('blive123 · started: 2m · activity: now · running')
+    const stale = find(rendered, 'bg-bstale12')
+    expect(text(stale.children[1])).toBe('bstale12 · started: 2h · stale')
+    const sub = find(rendered, 'bg-bsub123')
+    expect(text(sub.children[1])).toBe('bsub123 · started: 1m · activity: now · running')
+    expect(text(rendered)).not.toContain('Already done')
+    expect(text(rendered)).not.toContain('Stopped by model')
+    expect(text(rendered)).not.toContain('Ancient task')
+    const bar = await band($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(bar)).toContain('2 bg · 1 stale')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
+
+test('marks a background task unverified when liveness cannot be probed', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-unknown'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-unknown')
+  mkdirSync(tasks, { recursive: true })
+  const now = env.now()
+  const path = join(tasks, 'bunkn123.output')
+  await Bun.write(path, 'out')
+  utimesSync(path, new Date(now), new Date(now))
+  await Bun.write(
+    `${dir}.jsonl`,
+    [
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: new Date(now - 180_000).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'tu1',
+            name: 'Bash',
+            input: { command: 'sleep 600', description: 'Probe me', run_in_background: true },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date(now - 180_000).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tu1',
+            content: `Command running in background with ID: bunkn123. Output is being written to: ${path}. You will be notified when it completes.`,
+          }],
+        },
+      }),
+    ].join('\n') + '\n',
+  )
+  let pane: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    process: {
+      run: async (command: string[]) => command[0].endsWith('/lsof')
+        ? { exitCode: 2, stdout: '', stderr: 'lsof failed' }
+        : env.$.process.run(command),
+    },
+    agent: { list: async () => [] },
+    fs: {
+      ...env.$.fs,
+      stat: async (p: string) => p === '/usr/sbin/lsof' || p === '/usr/bin/lsof'
+        ? { size: 1, mtimeMs: 0 }
+        : env.$.fs.stat(p),
+      exists: async (p: string) => existsSync(p),
+      list: async (p: string) =>
+        readdirSync(p, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(p, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+
+  try {
+    const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
+    expect(text(rendered)).toContain('Background (1)')
+    expect(text(rendered)).toContain('bunkn123 · started: 3m · activity: now · unverified')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval

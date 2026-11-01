@@ -151,6 +151,26 @@ async function tailText($: EngineInterface, path: string): Promise<string | unde
   ].join('\n'))
 }
 
+/** The bytes after `offset`, or undefined when the file cannot be read. */
+async function readFrom($: EngineInterface, path: string, offset: number): Promise<string | undefined> {
+  if (!(await onWindows($))) {
+    const out = await $.process.run(['/usr/bin/tail', '-c', `+${offset + 1}`, path]).catch(() => undefined)
+    return out?.exitCode === 0 ? out.stdout : undefined
+  }
+  const run = await powershell($, [
+    `$s=[IO.File]::Open(${psLiteral(path)},'Open','Read','ReadWrite, Delete')`,
+    `$n=$s.Length-${offset}`,
+    'if($n -gt 0){',
+    `  [void]$s.Seek(${offset},'Begin')`,
+    '  $b=New-Object byte[] $n;$r=0',
+    '  while($r -lt $n){$k=$s.Read($b,$r,$n-$r);if($k -le 0){break};$r+=$k}',
+    '  $o=[Console]::OpenStandardOutput();$o.Write($b,0,$r);$o.Flush()',
+    '}',
+    '$s.Close()',
+  ].join('\n'))
+  return run?.exitCode === 0 ? run.stdout : undefined
+}
+
 async function headLine($: EngineInterface, path: string): Promise<string | undefined> {
   if (!(await onWindows($))) {
     const out = await $.process.run(['/usr/bin/head', '-n', '1', path]).catch(() => undefined)
@@ -901,6 +921,346 @@ async function lastActivity($: EngineInterface, runs: WorkflowRun[]): Promise<Ac
   return value
 }
 
+type BgStatus = 'starting' | 'running' | 'unknown' | 'stale'
+type BgTask = { id: string; label: string; path: string; startedAt: number; at: number; status: BgStatus }
+type BgOpen = Omit<BgTask, 'status'>
+type BgFile = { seeded: boolean; offset: number; carry: string }
+type BgState = {
+  session: string
+  open: Map<string, BgOpen>
+  closed: Set<string>
+  tools: Map<string, { label: string; command: string }>
+  main: BgFile
+  files: Map<string, BgFile>
+  backfilled: boolean
+}
+
+// Background tasks have no plugin API; the launch result in a transcript is the only record. A task is open until
+// its <task-notification> or a TaskStop, and only a held output file proves it still runs: mtime stops while a
+// silent task is alive, and the file survives after a task dies.
+// shortcut: private transcript format; a changed shape hides tasks instead of showing wrong ones.
+const BG_SCAN_MS = 30_000
+const BG_RECENT_MS = 120_000
+const BG_GRACE_MS = 10_000
+const BG_KEEP_MS = 24 * 60 * 60_000
+const BG_PROBE_MAX = 64
+const BG_ANCHOR = '"run_in_background":true|Command running in background with ID:|<task-id>|"name":"TaskStop"'
+const BG_LAUNCH =
+  /Command running in background with ID: ([A-Za-z0-9]+)\. Output is being written to: ([\s\S]+?)\. You will be notified/
+
+let bgCache: { at: number; list: BgTask[] } | undefined
+let bgState: BgState | undefined
+let lsof: string | null | undefined
+
+const bgNewFile = (): BgFile => ({ seeded: false, offset: 0, carry: '' })
+const bgNewState = (session: string): BgState => ({
+  session,
+  open: new Map(),
+  closed: new Set(),
+  tools: new Map(),
+  main: bgNewFile(),
+  files: new Map(),
+  backfilled: false,
+})
+
+function bgClose(state: BgState, id: string) {
+  state.open.delete(id)
+  state.closed.add(id)
+}
+
+function bgParse(text: string, state: BgState) {
+  for (const line of text.split('\n')) {
+    if (
+      !line.includes('run_in_background') &&
+      !line.includes('Command running in background with ID:') &&
+      !line.includes('<task-id>') &&
+      !line.includes('TaskStop')
+    ) continue
+    let record: any
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (record?.type === 'assistant') {
+      const content = record.message?.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (block?.type !== 'tool_use' || typeof block.id !== 'string') continue
+        if (block.name === 'Bash' && block.input?.run_in_background === true) {
+          state.tools.set(block.id, {
+            label: typeof block.input.description === 'string' ? block.input.description : '',
+            command: typeof block.input.command === 'string' ? block.input.command : '',
+          })
+        } else if (block.name === 'TaskStop' && typeof block.input?.task_id === 'string') {
+          bgClose(state, block.input.task_id)
+        }
+      }
+      continue
+    }
+    if (record?.type === 'user') {
+      const content = record.message?.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (block?.type !== 'tool_result') continue
+        const body = typeof block.content === 'string'
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('')
+            : ''
+        const hit = BG_LAUNCH.exec(body)
+        if (hit === null) continue
+        const id = hit[1]
+        const tool = typeof block.tool_use_id === 'string' ? state.tools.get(block.tool_use_id) : undefined
+        if (typeof block.tool_use_id === 'string') state.tools.delete(block.tool_use_id)
+        if (state.closed.has(id) || state.open.has(id)) continue
+        const started = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
+        state.open.set(id, {
+          id,
+          label: tool?.label.trim() || tool?.command.split('\n')[0].trim() || id,
+          path: hit[2],
+          startedAt: Number.isNaN(started) ? 0 : started,
+          at: 0,
+        })
+      }
+      continue
+    }
+    if (record?.type === 'queue-operation') {
+      const body = typeof record.content === 'string' ? record.content : ''
+      for (const hit of body.matchAll(/<task-id>([^<]+)<\/task-id>/g)) bgClose(state, hit[1])
+    }
+  }
+}
+
+async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, state: BgState): Promise<void> {
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat === undefined) return
+  if (file.seeded && stat.size < file.offset) {
+    file.seeded = false
+    file.offset = 0
+    file.carry = ''
+  }
+  if (!file.seeded) {
+    const text = await grepFile($, path, BG_ANCHOR).catch(() => undefined)
+    if (text === undefined) return
+    const after = await $.fs.stat(path).catch(() => undefined)
+    bgParse(text, state)
+    file.seeded = true
+    file.offset = after?.size ?? stat.size
+    file.carry = ''
+    return
+  }
+  if (stat.size === file.offset) return
+  const chunk = await readFrom($, path, file.offset).catch(() => undefined)
+  if (chunk === undefined) return
+  file.offset = stat.size
+  const text = file.carry + chunk
+  const cut = text.lastIndexOf('\n')
+  if (cut < 0) {
+    file.carry = text
+    return
+  }
+  file.carry = text.slice(cut + 1)
+  bgParse(text.slice(0, cut), state)
+}
+
+// Launches by subagents live only in their own transcripts; the completion notification still lands in the main one.
+async function bgSubagentFiles($: EngineInterface, dir: string, now: number, windowMs: number): Promise<string[]> {
+  const root = `${dir}/subagents`
+  if (await onWindows($)) {
+    const found: string[] = []
+    const walk = async (path: string, depth: number) => {
+      for (const entry of await $.fs.list(path).catch(() => [])) {
+        if (entry.kind === 'file') {
+          if (entry.name.endsWith('.jsonl') && now - entry.mtimeMs <= windowMs) found.push(`${path}/${entry.name}`)
+        } else if (entry.kind === 'dir' && depth > 0) {
+          await walk(`${path}/${entry.name}`, depth - 1)
+        }
+      }
+    }
+    await walk(root, 2)
+    return found
+  }
+  const run = await $.process
+    .run(['/usr/bin/find', root, '-name', '*.jsonl', '-mmin', `-${Math.max(1, Math.ceil(windowMs / 60_000))}`])
+    .catch(() => undefined)
+  return run?.exitCode === 0 ? run.stdout.split('\n').filter(Boolean) : []
+}
+
+// A session can hold hundreds of subagent transcripts; one grep -l marks the few that carry any anchor, so the
+// backfill reads their content only. Windows has no grep, so every file goes through the regular refresh.
+async function bgPrefilter($: EngineInterface, files: readonly string[]): Promise<Set<string>> {
+  if (await onWindows($)) return new Set(files)
+  const hits = new Set<string>()
+  for (let i = 0; i < files.length; i += 200) {
+    const run = await $.process
+      .run(['/usr/bin/grep', '-l', '-E', BG_ANCHOR, ...files.slice(i, i + 200)])
+      .catch(() => undefined)
+    if (run === undefined || run.exitCode > 1) continue
+    for (const line of run.stdout.split('\n')) if (line !== '') hits.add(line)
+  }
+  return hits
+}
+
+// One pass over the transcripts that predate this process. New launches are picked up by the recent window below,
+// so this runs off the render path and only once per session.
+async function bgBackfill($: EngineInterface, state: BgState, dir: string, now: number): Promise<void> {
+  const files = await bgSubagentFiles($, dir, now, BG_KEEP_MS)
+  const hits = await bgPrefilter($, files)
+  for (const path of files) {
+    if (!hits.has(path)) continue
+    let file = state.files.get(path)
+    if (file === undefined) {
+      file = bgNewFile()
+      state.files.set(path, file)
+    }
+    await bgRefreshFile($, path, file, state)
+  }
+}
+
+async function lsofPath($: EngineInterface): Promise<string | undefined> {
+  if (lsof !== undefined) return lsof ?? undefined
+  for (const path of ['/usr/sbin/lsof', '/usr/bin/lsof']) {
+    if ((await $.fs.stat(path).catch(() => undefined)) !== undefined) {
+      lsof = path
+      return path
+    }
+  }
+  lsof = null
+  return undefined
+}
+
+async function bgProbe($: EngineInterface, tasks: BgOpen[]): Promise<Map<string, 'alive' | 'dead' | 'unknown'>> {
+  const result = new Map<string, 'alive' | 'dead' | 'unknown'>()
+  const batch = tasks.slice(0, BG_PROBE_MAX)
+  for (const task of tasks.slice(BG_PROBE_MAX)) result.set(task.id, 'unknown')
+  if (batch.length === 0) return result
+  if (await onWindows($)) {
+    const paths = batch.map(task => task.path.replace(/\//g, '\\'))
+    const script = [
+      `$paths=@(${paths.map(psLiteral).join(',')})`,
+      '$o=[Console]::OpenStandardOutput()',
+      '$e=New-Object Text.UTF8Encoding($false)',
+      'for($i=0;$i -lt $paths.Length;$i++){',
+      "  $r='dead'",
+      "  try{$s=[IO.File]::Open($paths[$i],'Open','Read','None');$s.Close()}",
+      "  catch [IO.FileNotFoundException]{$r='dead'}",
+      "  catch [IO.IOException]{$r='alive'}",
+      "  catch {$r='unknown'}",
+      '  $b=$e.GetBytes("$i|$r`n");$o.Write($b,0,$b.Length)',
+      '}',
+      '$o.Flush()',
+    ].join('\n')
+    const run = await powershell($, script)
+    if (run === undefined || run.exitCode !== 0) {
+      for (const task of batch) result.set(task.id, 'unknown')
+      return result
+    }
+    for (const line of run.stdout.split('\n')) {
+      const [index, status] = line.trim().split('|')
+      const task = batch[Number(index)]
+      if (task !== undefined && (status === 'alive' || status === 'dead' || status === 'unknown')) {
+        result.set(task.id, status)
+      }
+    }
+    for (const task of batch) if (!result.has(task.id)) result.set(task.id, 'unknown')
+    return result
+  }
+  const command = await lsofPath($)
+  if (command === undefined) {
+    for (const task of batch) result.set(task.id, 'unknown')
+    return result
+  }
+  const run = await $.process.run([command, '-F', 'pn', '--', ...batch.map(task => task.path)]).catch(() => undefined)
+  if (run === undefined || run.exitCode > 1) {
+    for (const task of batch) result.set(task.id, 'unknown')
+    return result
+  }
+  const held = new Set(
+    run.stdout
+      .split('\n')
+      .filter(line => line.startsWith('n'))
+      .map(line => line.slice(1).replace(/ \(deleted\)$/, '')),
+  )
+  for (const task of batch) result.set(task.id, held.has(task.path) ? 'alive' : 'dead')
+  return result
+}
+
+const BG_RANK: Record<BgStatus, number> = { running: 0, starting: 1, unknown: 2, stale: 3 }
+
+async function bgBuild($: EngineInterface, state: BgState, now: number): Promise<BgTask[]> {
+  const open = [...state.open.values()]
+  const probe: BgOpen[] = []
+  const verdict = new Map<string, 'alive' | 'dead' | 'unknown'>()
+  for (const task of open) {
+    const stat = await $.fs.stat(task.path).catch(() => undefined)
+    if (stat === undefined) {
+      task.at = 0
+      verdict.set(task.id, 'dead')
+    } else {
+      task.at = stat.mtimeMs
+      probe.push(task)
+    }
+  }
+  for (const [id, status] of await bgProbe($, probe)) verdict.set(id, status)
+  const list: BgTask[] = []
+  for (const task of open) {
+    const probed = verdict.get(task.id) ?? 'unknown'
+    const status: BgStatus = probed === 'alive'
+      ? 'running'
+      : now - task.startedAt < BG_GRACE_MS
+        ? 'starting'
+        : probed === 'dead'
+          ? 'stale'
+          : 'unknown'
+    if ((status === 'stale' || status === 'unknown') && now - Math.max(task.at, task.startedAt) > BG_KEEP_MS) continue
+    list.push({ ...task, status })
+  }
+  list.sort((a, b) => BG_RANK[a.status] - BG_RANK[b.status] || b.startedAt - a.startedAt)
+  return list
+}
+
+async function bgTasks($: EngineInterface): Promise<BgTask[]> {
+  const now = await $.clock.now()
+  if (bgCache !== undefined && now - bgCache.at < BG_SCAN_MS) return bgCache.list
+  const session = await $.session.id().catch(() => '')
+  if (bgState === undefined || bgState.session !== session) bgState = bgNewState(session)
+  const dir = await sessionDir($).catch(() => '')
+  if (dir === '') return bgCache?.list ?? []
+  await bgRefreshFile($, `${dir}.jsonl`, bgState.main, bgState)
+  for (const path of await bgSubagentFiles($, dir, now, BG_RECENT_MS)) {
+    let file = bgState.files.get(path)
+    if (file === undefined) {
+      file = bgNewFile()
+      bgState.files.set(path, file)
+    }
+    await bgRefreshFile($, path, file, bgState)
+  }
+  if (!bgState.backfilled) {
+    bgState.backfilled = true
+    const state = bgState
+    void bgBackfill($, state, dir, now)
+      .catch(() => undefined)
+      .finally(() => {
+        if (bgState === state) bgCache = undefined
+      })
+  }
+  const list = await bgBuild($, bgState, now)
+  bgCache = { at: now, list }
+  return list
+}
+
+const bgText = (status: BgStatus) => status === 'unknown' ? 'unverified' : status
+const bgSpan = (task: BgTask, now: number) =>
+  [
+    task.id,
+    task.startedAt > 0 ? `started: ${ago(now - task.startedAt)}` : '',
+    task.at > 0 ? `activity: ${activityText(now - task.at)}` : '',
+    bgText(task.status),
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
 function ago(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
   if (seconds < 5) return 'now'
@@ -1059,11 +1419,17 @@ export const register: Register = on => {
     const wf = await runningWorkflows($).catch(() => [])
     const wfAgents = wf.reduce((n, w) => n + w.agents.length, 0)
     const totalAgents = active + wfAgents
+    const bg = await bgTasks($).catch(() => [])
+    const bgLive = bg.filter(t => t.status !== 'stale').length
+    const bgStale = bg.length - bgLive
     const act = await lastActivity($, wf).catch(() => undefined)
-    live = active > 0 || wf.length > 0
+    const latest = Math.max(act?.at ?? 0, ...bg.map(t => t.at))
+    live = active > 0 || wf.length > 0 || bgLive > 0
     const badge = [
       wf.length > 0 ? `${wf.length} wf` : '',
       totalAgents > 0 ? `${totalAgents} agent${totalAgents === 1 ? '' : 's'}` : '',
+      bgLive > 0 ? `${bgLive} bg` : '',
+      bgStale > 0 ? `${bgStale} stale` : '',
     ]
       .filter(Boolean)
       .join(' · ')
@@ -1075,7 +1441,7 @@ export const register: Register = on => {
           title: 'Agents',
           focus: true,
           closeOnEscape: true,
-          rows: Math.min(20, totalAgents + 2 * wf.length + 3),
+          rows: Math.min(20, totalAgents + 2 * wf.length + 2 * bg.length + 3),
         })
         .catch(() => undefined)
       if (result !== undefined && result.isPlaced !== false) {
@@ -1088,6 +1454,7 @@ export const register: Register = on => {
           `${w.title} · ${progress(w)}`,
           ...w.agents.map(a => `  ${[a.label, a.model, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`].filter(Boolean).join(' · ')}`),
         ]),
+        ...bg.map(t => `${t.label} · ${bgText(t.status)}`),
       ]
       $.ui.toast(lines.join('\n'), 8000)
     }
@@ -1130,7 +1497,7 @@ export const register: Register = on => {
             </Button>
           )}
         </Box>
-        {act !== undefined && act.at > 0 && <Text dimColor>activity: {activityText(now - act.at)}</Text>}
+        {latest > 0 && <Text dimColor>activity: {activityText(now - latest)}</Text>}
       </Box>
     )
   }).catch(($, e, next) => next(e))
@@ -1150,6 +1517,7 @@ export const register: Register = on => {
     }
     const rows = await liveAgents($)
     const runs = await runningWorkflows($).catch(() => [])
+    const bg = await bgTasks($).catch(() => [])
     const now = await $.clock.now()
     const act = await lastActivity($, runs).catch(() => undefined)
     const dir = await sessionDir($).catch(() => '')
@@ -1179,33 +1547,61 @@ export const register: Register = on => {
       // No width: bodyColumns is narrower than the webview pane, so lines would truncate mid-pane.
       <Box flexDirection="column" gap={1}>
         {rows.length === 0 ? (
-          <Text dimColor>{runs.length > 0 ? 'No direct agent — see Workflows below' : 'No agent running'}</Text>
+          <Text dimColor>
+            {runs.length > 0
+              ? 'No direct agent — see Workflows below'
+              : bg.length > 0
+                ? 'No direct agent — see Background below'
+                : 'No agent running'}
+          </Text>
         ) : (
-          rows.map(a => {
-            const span = timeline(startedAt.get(a.id), act?.agents[a.id])
-            return (
-              <Box key={a.id} flexDirection="column">
-                {/* Same shape as a workflow: the name on top, id and the rest on the line below. */}
+          <Box flexDirection="column" gap={1}>
+            <Text bold>
+              Agents ({rows.length})
+            </Text>
+            {rows.map(a => {
+              const span = timeline(startedAt.get(a.id), act?.agents[a.id])
+              return (
+                <Box key={a.id} flexDirection="column">
+                  {/* Same shape as a workflow: the name on top, id and the rest on the line below. */}
+                  <Text bold wrap="truncate-end">
+                    {agentName(a)}
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    {a.id.slice(0, 8)}
+                    {' · '}
+                    {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
+                    {modelText.get(a.id) ?? ''}
+                    {' · '}
+                    {a.status}
+                    {tokenText.get(a.id) ?? ''}
+                  </Text>
+                  {span !== '' && (
+                    <Text dimColor wrap="truncate-end">
+                      {span}
+                    </Text>
+                  )}
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+        {bg.length > 0 && (
+          <Box flexDirection="column" gap={1}>
+            <Text bold>
+              Background ({bg.length})
+            </Text>
+            {bg.map(t => (
+              <Box key={`bg-${t.id}`} flexDirection="column">
                 <Text bold wrap="truncate-end">
-                  {agentName(a)}
+                  {t.label}
                 </Text>
                 <Text dimColor wrap="truncate-end">
-                  {a.id.slice(0, 8)}
-                  {' · '}
-                  {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
-                  {modelText.get(a.id) ?? ''}
-                  {' · '}
-                  {a.status}
-                  {tokenText.get(a.id) ?? ''}
+                  {bgSpan(t, now)}
                 </Text>
-                {span !== '' && (
-                  <Text dimColor wrap="truncate-end">
-                    {span}
-                  </Text>
-                )}
               </Box>
-            )
-          })
+            ))}
+          </Box>
         )}
         {runs.length > 0 && (
           <Box flexDirection="column" gap={1}>
