@@ -545,7 +545,7 @@ test('titles a running workflow with its script meta and names it by task id', a
     expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · activity: now')
     const wfAgent = find(rendered, 'wf_abc-0')
     expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
-    expect(text(wfAgent.children[1])).toBe('  running: Bash · Poll build · 5m')
+    expect(text(wfAgent.children[1])).toBe('  running: Bash · Poll build')
     expect(text(wfAgent.children[2])).toBe('  started: 5m · activity: 5m ago')
     expect(text(rendered)).toContain('Agents (1)')
     const agentBox = find(rendered, 'b2')
@@ -672,7 +672,7 @@ test('names the tool a live agent is running right now', async () => {
     const agentBox = find(rendered, 'a1')
     expect(text(agentBox.children[0])).toBe('Author Task 23 USER-RUN script')
     expect(text(agentBox.children[1])).toBe('a1 · subagent · claude-opus-5-5 · running · 130k tokens')
-    expect(text(agentBox.children[2])).toBe('running: Bash · Replace $OUT/evidence uses with $EV · 11s')
+    expect(text(agentBox.children[2])).toBe('running: Bash · Replace $OUT/evidence uses with $EV')
     expect(text(agentBox.children[3])).toBe('started: 30s · activity: now')
     // A tool whose result is already in the transcript is not running.
     expect(text(rendered)).not.toContain('Read · a.ts')
