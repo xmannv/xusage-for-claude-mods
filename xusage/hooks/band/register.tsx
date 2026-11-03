@@ -911,16 +911,39 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
 const AGENT_TOOLS = 32
 const agentTools = new Map<string, { size: number; mtimeMs: number; tool: string | undefined }>()
 
-// The tool name is left out, like the host's own status line: the description says what is happening, and a
-// long MCP name would only eat the width.
+// Same shape as the host's activity line: a verb plus its target ("Reading acquisition.py"), while a tool that
+// already carries its own description keeps it bare.
+const TOOL_ACTION: Record<string, string> = {
+  Read: 'Reading',
+  Write: 'Writing',
+  Edit: 'Editing',
+  NotebookEdit: 'Editing notebook',
+  Glob: 'Finding',
+  Grep: 'Searching for',
+  WebFetch: 'Fetching',
+  WebSearch: 'Searching for',
+}
+
 function toolLabel(name: string, input: unknown): string {
   const fields = (input ?? {}) as Record<string, unknown>
   const description = typeof fields.description === 'string' ? fields.description.trim() : ''
   if (description !== '') return description
   const command = typeof fields.command === 'string' ? fields.command.trim().split('\n')[0] : ''
   if (command !== '') return command.slice(0, 60)
-  const file = typeof fields.file_path === 'string' ? fields.file_path : ''
-  if (file !== '') return file.split(/[\\/]/).pop() ?? name
+  const path = typeof fields.file_path === 'string'
+    ? fields.file_path
+    : typeof fields.notebook_path === 'string' ? fields.notebook_path : ''
+  const file = path === '' ? '' : path.split(/[\\/]/).pop() ?? path
+  const action = TOOL_ACTION[name]
+  if (action !== undefined) {
+    const target = file !== ''
+      ? file
+      : typeof fields.pattern === 'string' ? fields.pattern
+        : typeof fields.url === 'string' ? fields.url
+          : typeof fields.query === 'string' ? fields.query : ''
+    if (target !== '') return `${action} ${target}`
+  }
+  if (file !== '') return file
   return name
 }
 

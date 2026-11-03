@@ -583,24 +583,6 @@ test('names the last tool a live agent started', async () => {
           usage: { input_tokens: 1, output_tokens: 1 },
           content: [{
             type: 'tool_use',
-            id: 'tu-done',
-            name: 'Read',
-            input: { file_path: '/tmp/work/sub/a.ts' },
-          }],
-        },
-      }),
-      JSON.stringify({
-        type: 'user',
-        message: { content: [{ type: 'tool_result', tool_use_id: 'tu-done', content: 'ok' }] },
-      }),
-      JSON.stringify({
-        type: 'assistant',
-        timestamp: stamp(11_000),
-        message: {
-          model: 'claude-opus-5-5',
-          usage: { input_tokens: 2, cache_read_input_tokens: 129_349, cache_creation_input_tokens: 465, output_tokens: 191 },
-          content: [{
-            type: 'tool_use',
             id: 'tu-live',
             name: 'Bash',
             input: { command: 'sed -i ...', description: 'Replace $OUT/evidence uses with $EV' },
@@ -610,6 +592,24 @@ test('names the last tool a live agent started', async () => {
       JSON.stringify({
         type: 'user',
         message: { content: [{ type: 'tool_result', tool_use_id: 'tu-live', content: 'done' }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: stamp(11_000),
+        message: {
+          model: 'claude-opus-5-5',
+          usage: { input_tokens: 2, cache_read_input_tokens: 129_349, cache_creation_input_tokens: 465, output_tokens: 191 },
+          content: [{
+            type: 'tool_use',
+            id: 'tu-done',
+            name: 'Read',
+            input: { file_path: '/tmp/work/sub/a.ts' },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tu-done', content: 'ok' }] },
       }),
       '',
     ].join('\n'),
@@ -679,10 +679,10 @@ test('names the last tool a live agent started', async () => {
     const agentBox = find(rendered, 'a1')
     expect(text(agentBox.children[0])).toBe('Author Task 23 USER-RUN script')
     expect(text(agentBox.children[1])).toBe('a1 · subagent · claude-opus-5-5 · running · 130k tokens')
-    expect(text(agentBox.children[2])).toBe('Replace $OUT/evidence uses with $EV')
+    expect(text(agentBox.children[2])).toBe('Reading a.ts')
     expect(text(agentBox.children[3])).toBe('started: 30s · activity: now')
     // Only the newest tool, even though both already have results.
-    expect(text(agentBox.children[2])).not.toContain('a.ts')
+    expect(text(agentBox.children[2])).not.toContain('Replace $OUT/evidence uses with $EV')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
