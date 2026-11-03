@@ -1638,7 +1638,7 @@ export const register: Register = on => {
                     {tokenText.get(a.id) ?? ''}
                   </Text>
                   {toolText.has(a.id) && (
-                    <Text dimColor wrap="truncate-end">
+                    <Text color="inactive" wrap="truncate-end">
                       {toolText.get(a.id)}
                     </Text>
                   )}
@@ -1700,7 +1700,7 @@ export const register: Register = on => {
                           </Text>
                         </Text>
                         {a.tool !== undefined && (
-                          <Text dimColor wrap="truncate-end">{`  ${a.tool}`}</Text>
+                          <Text color="inactive" wrap="truncate-end">{`  ${a.tool}`}</Text>
                         )}
                         {agentSpan !== '' && (
                           <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
