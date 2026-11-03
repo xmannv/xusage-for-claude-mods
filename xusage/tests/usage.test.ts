@@ -323,6 +323,12 @@ test('renders compact usage labels without retry errors', async () => {
     if (node.props?.key === 'usage-error') return node
     return (node.children ?? []).map(warning).find(Boolean)
   }
+  const tone = (node: any, color: string): any => {
+    if (node == null || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) return node.map((child: any) => tone(child, color)).find(Boolean)
+    if (node.props?.color === color) return node
+    return (node.children ?? []).map((child: any) => tone(child, color)).find(Boolean)
+  }
 
   try {
     const event = { props: { hasSurvey: false, bodyColumns: 120 } }
@@ -331,6 +337,7 @@ test('renders compact usage labels without retry errors', async () => {
     expect(text(first)).not.toContain('usage request failed')
     expect(text(first)).not.toContain('retry in')
     expect(warning(first)).toBeUndefined()
+    expect(tone(first, 'warning')).toBeUndefined()
     env.advance(120_000)
     const second = await render($, event, async () => undefined)
     expect(text(second)).toContain('max20')
@@ -371,6 +378,7 @@ test('renders compact usage labels without retry errors', async () => {
     context = { tokens: 1_200_000, window: 1_000_000 }
     const millions = await render($, event, async () => undefined)
     expect(text(millions)).toContain('1.2M/1M')
+    expect(text(tone(millions, 'warning'))).toBe('1.2M/1M (cp 400k)')
     context = { tokens: 1_000_000, window: 1_000_000 }
     const exactMillion = await render($, event, async () => undefined)
     expect(text(exactMillion)).toContain('1M/1M')

@@ -1408,16 +1408,16 @@ function compactSize(value: unknown): number | undefined {
 }
 
 // Window only, not the firing threshold: the summary buffer and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE lower that further.
-async function compactSuffix($: EngineInterface, window: number | undefined): Promise<string> {
-  if (typeof window !== 'number') return ''
+async function compactInfo($: EngineInterface, window: number | undefined): Promise<{ text: string; at?: number }> {
+  if (typeof window !== 'number') return { text: '' }
   const settings = await compactSettings($)
-  if (settings?.autoCompactEnabled === false) return ''
+  if (settings?.autoCompactEnabled === false) return { text: '' }
   let value: number | undefined
   try {
     const disabled = await $.env.get('DISABLE_AUTO_COMPACT')
     const noCompact = await $.env.get('DISABLE_COMPACT')
     if (envFlag(disabled) || envFlag(noCompact) ||
-      envFlag(settings?.env?.DISABLE_AUTO_COMPACT) || envFlag(settings?.env?.DISABLE_COMPACT)) return ''
+      envFlag(settings?.env?.DISABLE_AUTO_COMPACT) || envFlag(settings?.env?.DISABLE_COMPACT)) return { text: '' }
     value = compactSize(await $.env.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW')) ??
       compactSize(settings?.env?.CLAUDE_CODE_AUTO_COMPACT_WINDOW)
   } catch {
@@ -1434,9 +1434,9 @@ async function compactSuffix($: EngineInterface, window: number | undefined): Pr
     const perModel = model === undefined ? undefined : settings?.modelSettings?.[model]?.autoCompactWindow
     value = compactSize(perModel) ?? compactSize(settings?.autoCompactWindow)
   }
-  if (value === undefined) return ''
+  if (value === undefined) return { text: '' }
   const effective = Math.min(Math.max(value, MIN_COMPACT), MAX_COMPACT, window)
-  return ` (cp ${tokenCount(effective)})`
+  return { text: ` (cp ${tokenCount(effective)})`, at: effective }
 }
 
 // settings.read can be refused by the runtime, so the files remain the source of truth.
@@ -1499,9 +1499,10 @@ export const register: Register = on => {
     const contextLabel = typeof context?.tokens === 'number' && typeof context.window === 'number'
       ? `${tokenCount(context.tokens)}/${tokenCount(context.window)}`
       : ''
-    const contextText = contextLabel === ''
-      ? ''
-      : `${contextLabel}${await compactSuffix($, context.window)}`
+    const compact = contextLabel === '' ? { text: '' } : await compactInfo($, context.window)
+    const contextText = `${contextLabel}${compact.text}`
+    // The auto-compact window is the real pressure point, unlike the 70/90 quota thresholds.
+    const contextHot = typeof context?.tokens === 'number' && compact.at !== undefined && context.tokens >= compact.at
     const agentRows = await liveAgents($)
     const active = agentRows.length
     const wf = await runningWorkflows($).catch(() => [])
@@ -1550,7 +1551,9 @@ export const register: Register = on => {
       return stack(
         <Box flexDirection="row" gap={2} alignItems="center" width={e.props.bodyColumns}>
           <Text dimColor>{u.source}</Text>
-          {contextText !== '' && <Text dimColor>{contextText}</Text>}
+          {contextText !== '' && (
+            <Text dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>
+          )}
         </Box>
       )
     }
@@ -1575,7 +1578,9 @@ export const register: Register = on => {
               )}
             </Text>
           ))}
-          {contextText !== '' && <Text dimColor>{contextText}</Text>}
+          {contextText !== '' && (
+            <Text dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>
+          )}
           {(badge !== '' || bgStale > 0) && (
             <Button key="agents" plain onPress={openAgents}>
               {/* Clickable counts stay on suggestion; a stale count is a warning, so it gets its own tone. */}
