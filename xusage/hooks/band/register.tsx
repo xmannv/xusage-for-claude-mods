@@ -911,14 +911,16 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
 const AGENT_TOOLS = 32
 const agentTools = new Map<string, { size: number; mtimeMs: number; tool: string | undefined }>()
 
+// The tool name is left out, like the host's own status line: the description says what is happening, and a
+// long MCP name would only eat the width.
 function toolLabel(name: string, input: unknown): string {
   const fields = (input ?? {}) as Record<string, unknown>
   const description = typeof fields.description === 'string' ? fields.description.trim() : ''
-  if (description !== '') return `${name} · ${description}`
-  const file = typeof fields.file_path === 'string' ? fields.file_path : ''
-  if (file !== '') return `${name} · ${file.split(/[\\/]/).pop()}`
+  if (description !== '') return description
   const command = typeof fields.command === 'string' ? fields.command.trim().split('\n')[0] : ''
-  if (command !== '') return `${name} · ${command.slice(0, 60)}`
+  if (command !== '') return command.slice(0, 60)
+  const file = typeof fields.file_path === 'string' ? fields.file_path : ''
+  if (file !== '') return file.split(/[\\/]/).pop() ?? name
   return name
 }
 
