@@ -905,9 +905,9 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
   return { model: model ?? '', tokens }
 }
 
-// The host's "Running <description>" line names the tool an agent is in the middle of. A tool_use with no
-// tool_result after it is still in flight, and a tool_use inside the tail window has every later record
-// there too, so the tail alone decides.
+// The host's background status line names what an agent is doing right now. A tool_use with no tool_result
+// after it is still in flight, and a tool_use inside the tail window has every later record there too, so
+// the tail alone decides.
 const AGENT_TOOLS = 32
 const agentTools = new Map<string, { size: number; mtimeMs: number; tool: string | undefined }>()
 
@@ -959,9 +959,6 @@ async function agentTool($: EngineInterface, path: string): Promise<string | und
   if (agentTools.size > AGENT_TOOLS) agentTools.delete(agentTools.keys().next().value!)
   return tool
 }
-
-// No duration: while a tool runs the transcript gets no new writes, so its age is already the activity line.
-const runningText = (tool: string): string => `running: ${tool}`
 
 async function lastActivity($: EngineInterface, runs: WorkflowRun[]): Promise<Activity> {
   const now = await $.clock.now()
@@ -1599,7 +1596,7 @@ export const register: Register = on => {
       const started = await agentStart($, path)
       if (started > 0) startedAt.set(a.id, started)
       const tool = await agentTool($, path)
-      if (tool !== undefined) toolText.set(a.id, runningText(tool))
+      if (tool !== undefined) toolText.set(a.id, tool)
     }
     const timeline = (started: number | undefined, at: number | undefined) =>
       [
@@ -1708,7 +1705,7 @@ export const register: Register = on => {
                           </Text>
                         </Text>
                         {a.tool !== undefined && (
-                          <Text dimColor wrap="truncate-end">{`  ${runningText(a.tool)}`}</Text>
+                          <Text dimColor wrap="truncate-end">{`  ${a.tool}`}</Text>
                         )}
                         {agentSpan !== '' && (
                           <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
