@@ -416,6 +416,9 @@ test('titles a running workflow with its script meta and names it by task id', a
             input: { command: 'xcodebuild ...', description: 'Poll build' },
           }],
         },
+      })}\n${JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tu_wf', content: 'ok' }] },
       })}\n`,
     )
     const past = new Date(Date.now() - 305_000)
@@ -561,7 +564,7 @@ test('titles a running workflow with its script meta and names it by task id', a
   }
 })
 
-test('names the tool a live agent is running right now', async () => {
+test('names the last tool a live agent started', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
   const session = 'sess-tool'
@@ -603,6 +606,10 @@ test('names the tool a live agent is running right now', async () => {
             input: { command: 'sed -i ...', description: 'Replace $OUT/evidence uses with $EV' },
           }],
         },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tu-live', content: 'done' }] },
       }),
       '',
     ].join('\n'),
@@ -674,8 +681,8 @@ test('names the tool a live agent is running right now', async () => {
     expect(text(agentBox.children[1])).toBe('a1 · subagent · claude-opus-5-5 · running · 130k tokens')
     expect(text(agentBox.children[2])).toBe('Replace $OUT/evidence uses with $EV')
     expect(text(agentBox.children[3])).toBe('started: 30s · activity: now')
-    // A tool whose result is already in the transcript is not running.
-    expect(text(rendered)).not.toContain('Read · a.ts')
+    // Only the newest tool, even though both already have results.
+    expect(text(agentBox.children[2])).not.toContain('a.ts')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval

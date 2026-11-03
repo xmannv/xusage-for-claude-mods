@@ -905,9 +905,9 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
   return { model: model ?? '', tokens }
 }
 
-// The host's background status line names what an agent is doing right now. A tool_use with no tool_result
-// after it is still in flight, and a tool_use inside the tail window has every later record there too, so
-// the tail alone decides.
+// The tool an agent started last, finished or not: most tools are shorter than the pane's refresh, so an
+// in-flight-only line would flash for long calls and never appear for quick ones. The activity line below
+// already says how old it is.
 const AGENT_TOOLS = 32
 const agentTools = new Map<string, { size: number; mtimeMs: number; tool: string | undefined }>()
 
@@ -935,9 +935,9 @@ async function agentTool($: EngineInterface, path: string): Promise<string | und
   }
   const out = await tailText($, path)
   if (out === undefined) return undefined
-  const pending = new Map<string, string>()
+  let tool: string | undefined
   for (const line of out.split('\n')) {
-    if (!line.includes('"tool_use"') && !line.includes('"tool_result"')) continue
+    if (!line.includes('"tool_use"')) continue
     let record: any
     try {
       record = JSON.parse(line)
@@ -947,14 +947,9 @@ async function agentTool($: EngineInterface, path: string): Promise<string | und
     const content = record?.message?.content
     if (!Array.isArray(content)) continue
     for (const part of content) {
-      if (part?.type === 'tool_use' && typeof part.id === 'string') {
-        pending.set(part.id, toolLabel(part.name, part.input))
-      } else if (part?.type === 'tool_result' && typeof part.tool_use_id === 'string') {
-        pending.delete(part.tool_use_id)
-      }
+      if (part?.type === 'tool_use') tool = toolLabel(part.name, part.input)
     }
   }
-  const tool = [...pending.values()].pop()
   agentTools.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, tool })
   if (agentTools.size > AGENT_TOOLS) agentTools.delete(agentTools.keys().next().value!)
   return tool
