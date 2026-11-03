@@ -1517,7 +1517,6 @@ export const register: Register = on => {
       wf.length > 0 ? `${wf.length} wf` : '',
       totalAgents > 0 ? `${totalAgents} agent${totalAgents === 1 ? '' : 's'}` : '',
       bgLive > 0 ? `${bgLive} bg` : '',
-      bgStale > 0 ? `${bgStale} stale` : '',
     ]
       .filter(Boolean)
       .join(' · ')
@@ -1577,10 +1576,14 @@ export const register: Register = on => {
             </Text>
           ))}
           {contextText !== '' && <Text dimColor>{contextText}</Text>}
-          {badge !== '' && (
+          {(badge !== '' || bgStale > 0) && (
             <Button key="agents" plain onPress={openAgents}>
+              {/* Clickable counts stay on suggestion; a stale count is a warning, so it gets its own tone. */}
               <Text bold color="suggestion">
                 {badge}
+                {bgStale > 0 && (
+                  <Text color="warning">{`${badge === '' ? '' : ' · '}${bgStale} stale`}</Text>
+                )}
               </Text>
             </Button>
           )}
@@ -1718,10 +1721,9 @@ export const register: Register = on => {
                     {w.title}
                   </Text>
                   <Text wrap="truncate-end">
-                    <Text dimColor>
-                      {w.task ?? w.id} · {w.agents.length} running
-                      {w.done > 0 ? ` · ${w.done} done` : ''}
-                    </Text>
+                    <Text dimColor>{w.task ?? w.id} · </Text>
+                    <Text color="success">{w.agents.length} running</Text>
+                    {w.done > 0 && <Text dimColor>{` · ${w.done} done`}</Text>}
                     {w.failed > 0 && <Text color="error">{` · ${w.failed} failed`}</Text>}
                     {span !== '' && <Text dimColor>{` · ${span}`}</Text>}
                   </Text>

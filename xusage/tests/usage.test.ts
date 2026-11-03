@@ -546,6 +546,8 @@ test('titles a running workflow with its script meta and names it by task id', a
     const wfBox = find(rendered, 'wf_abc')
     expect(text(wfBox.children[0])).toBe('S3 test-gap round 2 + review, then S4 -> S8')
     expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · activity: now')
+    const runningSpan = wfBox.children[1].children.find((child: any) => child?.props?.color === 'success')
+    expect(text(runningSpan)).toBe('1 running')
     const wfAgent = find(rendered, 'wf_abc-0')
     expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
     expect(text(wfAgent.children[1])).toBe('  Poll build')
@@ -848,6 +850,8 @@ test('shows background tasks and marks a dead silent one stale', async () => {
     expect(text(rendered)).not.toContain('Ancient task')
     const bar = await band($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
     expect(text(bar)).toContain('2 bg · 1 stale')
+    const staleSpan = find(bar, 'agents').children[0].children.find((child: any) => child?.props?.color === 'warning')
+    expect(text(staleSpan)).toBe(' · 1 stale')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
