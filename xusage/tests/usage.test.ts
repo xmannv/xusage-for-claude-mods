@@ -406,7 +406,16 @@ test('titles a running workflow with its script meta and names it by task id', a
       `${JSON.stringify({
         type: 'assistant',
         timestamp: new Date(Date.now() - 305_000).toISOString(),
-        message: { model: 'claude-opus-5', usage: { input_tokens: 1, cache_read_input_tokens: 49_999 } },
+        message: {
+          model: 'claude-opus-5',
+          usage: { input_tokens: 1, cache_read_input_tokens: 49_999 },
+          content: [{
+            type: 'tool_use',
+            id: 'tu_wf',
+            name: 'Bash',
+            input: { command: 'xcodebuild ...', description: 'Poll build' },
+          }],
+        },
       })}\n`,
     )
     const past = new Date(Date.now() - 305_000)
@@ -470,7 +479,9 @@ test('titles a running workflow with its script meta and names it by task id', a
   })
   const originalH = globalThis.h
   const originalSetInterval = globalThis.setInterval
-  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  // React drops falsy children, so the index-based assertions below should not see them either.
+  globalThis.h = ((type: any, props: any, ...children: any[]) =>
+    ({ type, props, children: children.filter(child => child !== false && child != null) })) as any
   globalThis.setInterval = (() => 1) as any
   const $ = {
     ...env.$,
@@ -534,7 +545,8 @@ test('titles a running workflow with its script meta and names it by task id', a
     expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · activity: now')
     const wfAgent = find(rendered, 'wf_abc-0')
     expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · S8 · 50k tokens')
-    expect(text(wfAgent.children[1])).toBe('  started: 5m · activity: 5m ago')
+    expect(text(wfAgent.children[1])).toBe('  running: Bash · Poll build · 5m')
+    expect(text(wfAgent.children[2])).toBe('  started: 5m · activity: 5m ago')
     expect(text(rendered)).toContain('Agents (1)')
     const agentBox = find(rendered, 'b2')
     expect(text(agentBox.children[0])).toBe('Implement top-up bonus rate')
@@ -543,6 +555,127 @@ test('titles a running workflow with its script meta and names it by task id', a
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
     expect(text(rendered)).toContain('started: 1h20m · activity: now')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
+
+test('names the tool a live agent is running right now', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(12))
+  const session = 'sess-tool'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(join(dir, 'subagents'), { recursive: true })
+  const stamp = (offset: number) => new Date(env.now() - offset).toISOString()
+  const transcript = join(dir, 'subagents', 'agent-a1.jsonl')
+  await Bun.write(
+    transcript,
+    [
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: stamp(30_000),
+        message: {
+          model: 'claude-opus-5-5',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          content: [{
+            type: 'tool_use',
+            id: 'tu-done',
+            name: 'Read',
+            input: { file_path: '/tmp/work/sub/a.ts' },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tu-done', content: 'ok' }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: stamp(11_000),
+        message: {
+          model: 'claude-opus-5-5',
+          usage: { input_tokens: 2, cache_read_input_tokens: 129_349, cache_creation_input_tokens: 465, output_tokens: 191 },
+          content: [{
+            type: 'tool_use',
+            id: 'tu-live',
+            name: 'Bash',
+            input: { command: 'sed -i ...', description: 'Replace $OUT/evidence uses with $EV' },
+          }],
+        },
+      }),
+      '',
+    ].join('\n'),
+  )
+  utimesSync(transcript, new Date(env.now()), new Date(env.now()))
+  let pane: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    agent: {
+      list: async () => [
+        { id: 'a1', description: 'Author Task 23 USER-RUN script', type: 'local_agent', status: 'running' },
+      ],
+    },
+    fs: {
+      ...env.$.fs,
+      exists: async (path: string) => existsSync(path),
+      list: async (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+  const find = (node: any, key: string): any => {
+    if (node == null || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = find(child, key)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (node.props?.key === key) return node
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      const hit = find(child, key)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+
+  try {
+    const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
+    expect(text(rendered)).toContain('Agents (1)')
+    const agentBox = find(rendered, 'a1')
+    expect(text(agentBox.children[0])).toBe('Author Task 23 USER-RUN script')
+    expect(text(agentBox.children[1])).toBe('a1 · subagent · claude-opus-5-5 · running · 130k tokens')
+    expect(text(agentBox.children[2])).toBe('running: Bash · Replace $OUT/evidence uses with $EV · 11s')
+    expect(text(agentBox.children[3])).toBe('started: 30s · activity: now')
+    // A tool whose result is already in the transcript is not running.
+    expect(text(rendered)).not.toContain('Read · a.ts')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval

@@ -616,6 +616,7 @@ type WorkflowRun = {
     tokens: number | undefined
     startedAt: number
     at: number
+    tool: AgentTool | undefined
   }[]
   done: number
   failed: number
@@ -833,6 +834,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
         tokens: usage?.tokens,
         startedAt: path === undefined ? 0 : await agentStart($, path),
         at: path === undefined ? 0 : await mtime($, path),
+        tool: path === undefined ? undefined : await agentTool($, path),
       })
     }
     const info = await workflowInfo($, dir, name)
@@ -901,6 +903,67 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
     }
   }
   return { model: model ?? '', tokens }
+}
+
+type AgentTool = { label: string; since: number }
+
+// The host's "Running <description>" line names the tool an agent is in the middle of. A tool_use with no
+// tool_result after it is still in flight, and a tool_use inside the tail window has every later record
+// there too, so the tail alone decides.
+const AGENT_TOOLS = 32
+const agentTools = new Map<string, { size: number; mtimeMs: number; tool: AgentTool | undefined }>()
+
+function toolLabel(name: string, input: unknown): string {
+  const fields = (input ?? {}) as Record<string, unknown>
+  const description = typeof fields.description === 'string' ? fields.description.trim() : ''
+  if (description !== '') return `${name} · ${description}`
+  const file = typeof fields.file_path === 'string' ? fields.file_path : ''
+  if (file !== '') return `${name} · ${file.split(/[\\/]/).pop()}`
+  const command = typeof fields.command === 'string' ? fields.command.trim().split('\n')[0] : ''
+  if (command !== '') return `${name} · ${command.slice(0, 60)}`
+  return name
+}
+
+async function agentTool($: EngineInterface, path: string): Promise<AgentTool | undefined> {
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat === undefined) return undefined
+  const held = agentTools.get(path)
+  if (held !== undefined && held.size === stat.size && held.mtimeMs === stat.mtimeMs) {
+    agentTools.delete(path)
+    agentTools.set(path, held)
+    return held.tool
+  }
+  const out = await tailText($, path)
+  if (out === undefined) return undefined
+  const pending = new Map<string, AgentTool>()
+  for (const line of out.split('\n')) {
+    if (!line.includes('"tool_use"') && !line.includes('"tool_result"')) continue
+    let record: any
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const content = record?.message?.content
+    if (!Array.isArray(content)) continue
+    const since = Date.parse(record.timestamp ?? '') || 0
+    for (const part of content) {
+      if (part?.type === 'tool_use' && typeof part.id === 'string') {
+        pending.set(part.id, { label: toolLabel(part.name, part.input), since })
+      } else if (part?.type === 'tool_result' && typeof part.tool_use_id === 'string') {
+        pending.delete(part.tool_use_id)
+      }
+    }
+  }
+  const tool = [...pending.values()].pop()
+  agentTools.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, tool })
+  if (agentTools.size > AGENT_TOOLS) agentTools.delete(agentTools.keys().next().value!)
+  return tool
+}
+
+const runningText = (tool: AgentTool, now: number): string => {
+  const took = tool.since > 0 ? ago(now - tool.since) : ''
+  return `running: ${tool.label}${took === '' || took === 'now' ? '' : ` · ${took}`}`
 }
 
 async function lastActivity($: EngineInterface, runs: WorkflowRun[]): Promise<Activity> {
@@ -1530,6 +1593,7 @@ export const register: Register = on => {
     const modelText = new Map<string, string>()
     const tokenText = new Map<string, string>()
     const startedAt = new Map<string, number>()
+    const toolText = new Map<string, string>()
     for (const a of rows) {
       const path = `${dir}/subagents/agent-${a.id}.jsonl`
       const { model, tokens } = await agentUsage($, path)
@@ -1537,6 +1601,8 @@ export const register: Register = on => {
       if (tokens !== undefined) tokenText.set(a.id, ` · ${tokenCount(tokens)} tokens`)
       const started = await agentStart($, path)
       if (started > 0) startedAt.set(a.id, started)
+      const tool = await agentTool($, path)
+      if (tool !== undefined) toolText.set(a.id, runningText(tool, now))
     }
     const timeline = (started: number | undefined, at: number | undefined) =>
       [
@@ -1582,6 +1648,11 @@ export const register: Register = on => {
                     {a.status}
                     {tokenText.get(a.id) ?? ''}
                   </Text>
+                  {toolText.has(a.id) && (
+                    <Text dimColor wrap="truncate-end">
+                      {toolText.get(a.id)}
+                    </Text>
+                  )}
                   {span !== '' && (
                     <Text dimColor wrap="truncate-end">
                       {span}
@@ -1639,6 +1710,9 @@ export const register: Register = on => {
                               .join('')}
                           </Text>
                         </Text>
+                        {a.tool !== undefined && (
+                          <Text dimColor wrap="truncate-end">{`  ${runningText(a.tool, now)}`}</Text>
+                        )}
                         {agentSpan !== '' && (
                           <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
                         )}
