@@ -1314,10 +1314,17 @@ const bgSpan = (task: BgTask, now: number) =>
     task.id,
     task.startedAt > 0 ? `started: ${ago(now - task.startedAt)}` : '',
     task.at > 0 ? `activity: ${activityText(now - task.at)}` : '',
-    bgText(task.status),
   ]
     .filter(Boolean)
     .join(' · ')
+
+// The state word is the one run of text worth color: green is live, yellow needs a look, red failed.
+const statusTone = (status: string): string | undefined => {
+  if (status === 'running') return 'success'
+  if (status === 'waiting' || status === 'stale' || status === 'unknown') return 'warning'
+  if (status === 'failed' || status === 'dead') return 'error'
+  return undefined
+}
 
 function ago(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -1617,25 +1624,28 @@ export const register: Register = on => {
           </Text>
         ) : (
           <Box flexDirection="column" gap={1}>
-            <Text bold>
+            <Text bold color="inactive">
               Agents ({rows.length})
             </Text>
             {rows.map(a => {
               const span = timeline(startedAt.get(a.id), act?.agents[a.id])
+              const state = statusTone(a.status)
               return (
                 <Box key={a.id} flexDirection="column">
                   {/* Same shape as a workflow: the name on top, id and the rest on the line below. */}
                   <Text bold wrap="truncate-end">
                     {agentName(a)}
                   </Text>
-                  <Text dimColor wrap="truncate-end">
-                    {a.id.slice(0, 8)}
-                    {' · '}
-                    {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
-                    {modelText.get(a.id) ?? ''}
-                    {' · '}
-                    {a.status}
-                    {tokenText.get(a.id) ?? ''}
+                  <Text wrap="truncate-end">
+                    <Text dimColor>
+                      {a.id.slice(0, 8)}
+                      {' · '}
+                      {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
+                      {modelText.get(a.id) ?? ''}
+                      {' · '}
+                    </Text>
+                    <Text color={state} dimColor={state === undefined}>{a.status}</Text>
+                    {tokenText.has(a.id) && <Text dimColor>{tokenText.get(a.id)}</Text>}
                   </Text>
                   {toolText.has(a.id) && (
                     <Text color="inactive" wrap="truncate-end">
@@ -1654,7 +1664,7 @@ export const register: Register = on => {
         )}
         {bg.length > 0 && (
           <Box flexDirection="column" gap={1}>
-            <Text bold>
+            <Text bold color="inactive">
               Background ({bg.length})
             </Text>
             {bg.map(t => (
@@ -1662,8 +1672,11 @@ export const register: Register = on => {
                 <Text bold wrap="truncate-end">
                   {t.label}
                 </Text>
-                <Text dimColor wrap="truncate-end">
-                  {bgSpan(t, now)}
+                <Text wrap="truncate-end">
+                  <Text dimColor>{bgSpan(t, now)} · </Text>
+                  <Text color={statusTone(t.status)} dimColor={statusTone(t.status) === undefined}>
+                    {bgText(t.status)}
+                  </Text>
                 </Text>
               </Box>
             ))}
@@ -1671,7 +1684,7 @@ export const register: Register = on => {
         )}
         {runs.length > 0 && (
           <Box flexDirection="column" gap={1}>
-            <Text bold>
+            <Text bold color="inactive">
               Workflows ({runs.length})
             </Text>
             {runs.map(w => {
@@ -1681,9 +1694,13 @@ export const register: Register = on => {
                   <Text bold wrap="truncate-end">
                     {w.title}
                   </Text>
-                  <Text dimColor wrap="truncate-end">
-                    {w.task ?? w.id} · {progress(w)}
-                    {span === '' ? '' : ` · ${span}`}
+                  <Text wrap="truncate-end">
+                    <Text dimColor>
+                      {w.task ?? w.id} · {w.agents.length} running
+                      {w.done > 0 ? ` · ${w.done} done` : ''}
+                    </Text>
+                    {w.failed > 0 && <Text color="error">{` · ${w.failed} failed`}</Text>}
+                    {span !== '' && <Text dimColor>{` · ${span}`}</Text>}
                   </Text>
                   {w.agents.map((a, i) => {
                     const agentSpan = timeline(a.startedAt, a.at)
