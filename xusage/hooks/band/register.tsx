@@ -1670,8 +1670,10 @@ export const register: Register = on => {
                     <Text color={state} dimColor={state === undefined}>{a.status}</Text>
                     {tokenText.has(a.id) && <Text dimColor>{tokenText.get(a.id)}</Text>}
                   </Text>
+                  {/* inactiveShimmer, not inactive: ANSI themes map inactive to the terminal's white, which can be
+                      darker than the dim metadata around it. The shimmer tone stays lighter than that metadata. */}
                   {toolText.has(a.id) && (
-                    <Text color="inactive" wrap="truncate-end">
+                    <Text color="inactiveShimmer" wrap="truncate-end">
                       {toolText.get(a.id)}
                     </Text>
                   )}
@@ -1740,7 +1742,7 @@ export const register: Register = on => {
                           </Text>
                         </Text>
                         {a.tool !== undefined && (
-                          <Text color="inactive" wrap="truncate-end">{`  ${a.tool}`}</Text>
+                          <Text color="inactiveShimmer" wrap="truncate-end">{`  ${a.tool}`}</Text>
                         )}
                         {agentSpan !== '' && (
                           <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
