@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, utimesSync } from 'node:fs'
+import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readdirSync, rmSync, statSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -839,6 +839,8 @@ test('shows background tasks and marks a dead silent one stale', async () => {
     }
     return undefined
   }
+  // Windows has no lsof: the module asks PowerShell for an exclusive open, which only an open handle can refuse.
+  const held = process.env.OS === 'Windows_NT' ? [livePath, subPath].map(path => openSync(path, 'a')) : []
 
   try {
     const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
@@ -861,6 +863,7 @@ test('shows background tasks and marks a dead silent one stale', async () => {
     const staleSpan = find(bar, 'agents').children[0].children.find((child: any) => child?.props?.color === 'warning')
     expect(text(staleSpan)).toBe(' · 1 stale')
   } finally {
+    for (const handle of held) closeSync(handle)
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
   }
@@ -921,8 +924,9 @@ test('marks a background task unverified when liveness cannot be probed', async 
     ...env.$,
     clock: { now: async () => now },
     process: {
-      run: async (command: string[]) => command[0].endsWith('/lsof')
-        ? { exitCode: 2, stdout: '', stderr: 'lsof failed' }
+      // Windows probes through PowerShell instead of lsof, so both have to fail.
+      run: async (command: string[]) => command[0].endsWith('/lsof') || command[0].endsWith('powershell.exe')
+        ? { exitCode: 2, stdout: '', stderr: 'probe failed' }
         : env.$.process.run(command),
     },
     agent: { list: async () => [] },
