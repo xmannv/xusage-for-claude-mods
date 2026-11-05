@@ -1547,16 +1547,6 @@ export const register: Register = on => {
       $.ui.toast(lines.join('\n'), 8000)
     }
 
-    if (u.error !== undefined && u.windows.length === 0) {
-      return stack(
-        <Box flexDirection="row" gap={2} alignItems="center" width={e.props.bodyColumns}>
-          <Text dimColor>{u.source}</Text>
-          {contextText !== '' && (
-            <Text dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>
-          )}
-        </Box>
-      )
-    }
     const shownPlan = u.source === 'proxy'
       ? `proxy${u.plan ? ` ${u.plan}` : ''}`
       : (await currentPlan($, u.plan)) || 'claude'

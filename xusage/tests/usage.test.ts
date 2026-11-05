@@ -1112,3 +1112,65 @@ test('uses the current credential plan when cached usage is stale', async () => 
     globalThis.setInterval = originalSetInterval
   }
 })
+
+test('keeps plan, agents and activity when usage fails with nothing cached', async () => {
+  const { register } = await loadModule()
+  const env = engine(
+    async () => limited('3600'),
+    undefined,
+    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' },
+  )
+  const session = 'sess-usage-failed'
+  mkdirSync(join(env.root, 'projects', '-tmp-work'), { recursive: true })
+  await Bun.write(
+    join(env.root, 'projects', '-tmp-work', `${session}.jsonl`),
+    `${JSON.stringify({ type: 'user', timestamp: new Date(env.now()).toISOString() })}\n`,
+  )
+  let render: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'AbovePrompt') render = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    agent: { list: async () => [{ id: 'a1', name: 'worker', type: 'subagent', status: 'running' }] },
+    fs: {
+      ...env.$.fs,
+      exists: async (path: string) => existsSync(path),
+      list: async () => [],
+    },
+    session: {
+      id: async () => session,
+      root: async () => '/tmp/work',
+      cwd: async () => '/tmp/work',
+      usage: async () => ({ context: { tokens: 42_000, window: 258_000 } }),
+    },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+
+  try {
+    const band = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(band)).toContain('max20')
+    expect(text(band)).toContain('42k/258k')
+    expect(text(band)).toContain('1 agent')
+    expect(text(band)).toContain('activity:')
+    expect(text(band)).not.toContain('usage request failed')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
