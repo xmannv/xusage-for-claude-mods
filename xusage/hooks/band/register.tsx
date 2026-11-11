@@ -638,24 +638,57 @@ const STALE_MS = 60 * 60_000
 let workflows: { at: number; list: WorkflowRun[] } | undefined
 let sessionDirCache: { session: string; dir: string } | undefined
 
+// /resume inside a session launched with another id keeps that launch id as the live session id while the
+// transcript, its subagents and its workflows stay under the resumed conversation's id. The live file is the
+// recent one whose tail names the runtime id; the folder lookup above cannot see that.
+async function resumedDir(
+  $: EngineInterface,
+  projects: string,
+  folder: string,
+  session: string,
+): Promise<string | undefined> {
+  const now = await $.clock.now()
+  const files: { path: string; mtimeMs: number }[] = []
+  const seen = new Set<string>()
+  for (const root of [folder, ...(await $.fs.list(projects).catch(() => [])).map(p => `${projects}/${p.name}`)]) {
+    if (seen.has(root)) continue
+    seen.add(root)
+    for (const entry of await $.fs.list(root).catch(() => [])) {
+      if (entry.kind !== 'file' || !entry.name.endsWith('.jsonl')) continue
+      if (now - entry.mtimeMs > BG_KEEP_MS) continue
+      files.push({ path: `${root}/${entry.name}`, mtimeMs: entry.mtimeMs })
+    }
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const file of files) {
+    const tail = await tailText($, file.path).catch(() => undefined)
+    if (tail !== undefined && tail.includes(session)) return file.path.slice(0, -'.jsonl'.length)
+  }
+  return undefined
+}
+
 async function sessionDir($: EngineInterface): Promise<string> {
   const session = await $.session.id()
   if (sessionDirCache?.session === session) return sessionDirCache.dir
   const projects = `${await claudeDir($)}/projects`
   // root, not cwd: a shell cd moves cwd but never the session's project folder.
   const start = await $.session.root().catch(() => $.session.cwd())
-  const encoded = `${projects}/${start.replace(/[^a-zA-Z0-9]/g, '-')}/${session}`
+  const folder = `${projects}/${start.replace(/[^a-zA-Z0-9]/g, '-')}`
+  const encoded = `${folder}/${session}`
+  const found = async (base: string) =>
+    (await $.fs.exists(base).catch(() => false)) || (await $.fs.exists(`${base}.jsonl`).catch(() => false))
   let dir: string | undefined = encoded
-  if (!(await $.fs.exists(encoded).catch(() => false))) {
+  if (!(await found(encoded))) {
     dir = undefined
     for (const p of await $.fs.list(projects).catch(() => [])) {
       const candidate = `${projects}/${p.name}/${session}`
-      if (await $.fs.exists(candidate).catch(() => false)) {
+      if (await found(candidate)) {
         dir = candidate
         break
       }
     }
   }
+  dir ??= await resumedDir($, projects, folder, session).catch(() => undefined)
   // A folder not there yet is looked up again next time instead of being held for the whole session.
   if (dir === undefined) return encoded
   sessionDirCache = { session, dir }
@@ -1119,27 +1152,36 @@ async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, sta
     file.carry = ''
   }
   if (!file.seeded) {
+    const before = await $.fs.stat(path).catch(() => undefined)
+    if (before === undefined) return
     const text = await grepFile($, path, BG_ANCHOR).catch(() => undefined)
     if (text === undefined) return
-    const after = await $.fs.stat(path).catch(() => undefined)
     bgParse(text, state)
+    // The host caps a process's stdout (~4 MiB), which on a long transcript cuts the newest anchors off, so the
+    // launches made since the last scan are read again from the tail. Re-parsing a line is idempotent.
+    const tail = await readFrom($, path, Math.max(0, before.size - TAIL_BYTES)).catch(() => undefined)
+    if (tail !== undefined) bgParse(tail, state)
     file.seeded = true
-    file.offset = after?.size ?? stat.size
+    file.offset = before.size
     file.carry = ''
     return
   }
   if (stat.size === file.offset) return
   const chunk = await readFrom($, path, file.offset).catch(() => undefined)
   if (chunk === undefined) return
-  file.offset = stat.size
   const text = file.carry + chunk
   const cut = text.lastIndexOf('\n')
   if (cut < 0) {
+    // A single line past the cap: keep reading inside it on the next refresh instead of holding the offset.
+    file.offset += new TextEncoder().encode(chunk).length
     file.carry = text
     return
   }
   file.carry = text.slice(cut + 1)
   bgParse(text.slice(0, cut), state)
+  // Advance by the bytes actually parsed, not stat.size: a capped stdout leaves the rest for the next refresh.
+  file.offset += new TextEncoder().encode(chunk.slice(0, cut - (text.length - chunk.length) + 1)).length
+  if (file.offset > stat.size) file.offset = stat.size
 }
 
 // Launches by subagents live only in their own transcripts; the completion notification still lands in the main one.

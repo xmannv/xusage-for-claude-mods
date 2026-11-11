@@ -968,6 +968,202 @@ test('marks a background task unverified when liveness cannot be probed', async 
   }
 })
 
+// A pane harness for the background-task tests: lsof reports the listed outputs alive, every process.run
+// stdout is capped like the host caps it, and the test controls the clock.
+async function paneHarness(
+  env: ReturnType<typeof engine>,
+  options: { session: string; now: () => number; alive: string[]; cap?: number },
+) {
+  const { register } = await loadModule()
+  let pane: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const cap = options.cap ?? Number.POSITIVE_INFINITY
+  const held = process.env.OS === 'Windows_NT' ? options.alive.map(path => openSync(path, 'a')) : []
+  const $ = {
+    ...env.$,
+    clock: { now: async () => options.now() },
+    process: {
+      run: async (command: string[]) => {
+        if (command[0].endsWith('/lsof')) {
+          return {
+            exitCode: 0,
+            stdout: options.alive.map((path, i) => `p${i + 1}\nf1\nn${path}`).join('\n'),
+            stderr: '',
+          }
+        }
+        const result = await env.$.process.run(command)
+        return result.stdout.length > cap ? { ...result, stdout: result.stdout.slice(0, cap) } : result
+      },
+    },
+    agent: { list: async () => [] },
+    fs: {
+      ...env.$.fs,
+      stat: async (path: string) => path === '/usr/sbin/lsof' || path === '/usr/bin/lsof'
+        ? { size: 1, mtimeMs: 0 }
+        : env.$.fs.stat(path),
+      exists: async (path: string) => existsSync(path),
+      list: async (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: { id: async () => options.session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  return {
+    render: () => pane($, { requestId: 'usage-band-agents' }, async () => undefined),
+    restore: () => {
+      for (const handle of held) closeSync(handle)
+      globalThis.h = originalH
+      globalThis.setInterval = originalSetInterval
+    },
+  }
+}
+
+const paneText = (node: any): string => {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(paneText).join('')
+  return paneText(node.children ?? node.props?.children)
+}
+
+const bgLaunch = (tool: string, id: string, path: string, label: string, at: number, extra: Record<string, unknown> = {}) =>
+  [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(at).toISOString(),
+      ...extra,
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: tool,
+          name: 'Bash',
+          input: { command: 'bash work.sh', description: label, run_in_background: true },
+        }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: new Date(at).toISOString(),
+      ...extra,
+      message: {
+        content: [{
+          type: 'tool_result',
+          tool_use_id: tool,
+          content: `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`,
+        }],
+      },
+    }),
+  ].join('\n')
+
+test('finds background tasks under the resumed conversation id', async () => {
+  const env = engine(async () => ok(12))
+  const runtime = 'runtime-0001'
+  const conversation = 'fb281c7b-0000-4000-8000-000000000000'
+  const dir = join(env.root, 'projects', '-tmp-work', conversation)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-resumed')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 30_000
+  const output = join(tasks, 'bresume1.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  await Bun.write(
+    `${dir}.jsonl`,
+    `${bgLaunch('tu1', 'bresume1', output, 'Resumed shell', boot, { session_id: runtime })}\n`,
+  )
+  const harness = await paneHarness(env, { session: runtime, now: () => now, alive: [output] })
+  try {
+    const rendered = await harness.render()
+    expect(paneText(rendered)).toContain('Background (1)')
+    expect(paneText(rendered)).toContain('Resumed shell')
+    expect(paneText(rendered)).toContain('bresume1 · started: 30s · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
+// 700 progress lines carry the anchor, so grep's ~4 MiB-shaped stdout cap (here 300 kB) fills before the launch.
+const bgFiller = Array.from(
+  { length: 700 },
+  (_, i) => `{"type":"progress","n":${i},"text":"${'x'.repeat(400)}","run_in_background":true}`,
+).join('\n')
+
+test('recovers a launch past the capped grep output from the transcript tail', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-huge'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-huge')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 30_000
+  const output = join(tasks, 'bhuge123.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  await Bun.write(`${dir}.jsonl`, `${bgFiller}\n${bgLaunch('tu1', 'bhuge123', output, 'Late launch', boot)}\n`)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [output], cap: 300_000 })
+  try {
+    const rendered = await harness.render()
+    expect(paneText(rendered)).toContain('Background (1)')
+    expect(paneText(rendered)).toContain('Late launch')
+    expect(paneText(rendered)).toContain('bhuge123 · started: 30s · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
+test('keeps reading a capped refresh instead of skipping to the end of the file', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-grow'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-grow')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  let now = boot + 30_000
+  const first = join(tasks, 'bgrow001.output')
+  const second = join(tasks, 'bgrow002.output')
+  for (const path of [first, second]) {
+    await Bun.write(path, 'out')
+    utimesSync(path, new Date(now), new Date(now))
+  }
+  const transcript = `${dir}.jsonl`
+  await Bun.write(transcript, `${bgLaunch('tu1', 'bgrow001', first, 'First shell', boot)}\n`)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [first, second], cap: 300_000 })
+  try {
+    expect(paneText(await harness.render())).toContain('First shell')
+    await Bun.write(
+      transcript,
+      `${await Bun.file(transcript).text()}${bgFiller}\n${bgLaunch('tu2', 'bgrow002', second, 'Second shell', boot)}\n`,
+    )
+    now += 31_000
+    expect(paneText(await harness.render())).not.toContain('Second shell')
+    now += 31_000
+    const complete = paneText(await harness.render())
+    expect(complete).toContain('Second shell')
+    expect(complete).toContain('bgrow002')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('hides a finished background agent that the engine still reports as waiting', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
