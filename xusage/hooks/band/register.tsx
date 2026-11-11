@@ -613,6 +613,7 @@ type WorkflowRun = {
     label: string
     phase: string
     model: string
+    effort: string
     tokens: number | undefined
     startedAt: number
     at: number
@@ -874,6 +875,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       agents.push({
         ...a,
         model: usage?.model ?? '',
+        effort: usage?.effort ?? '',
         tokens: usage?.tokens,
         startedAt: path === undefined ? 0 : await agentStart($, path),
         at: path === undefined ? 0 : await mtime($, path),
@@ -920,19 +922,24 @@ async function transcriptTime($: EngineInterface, path: string): Promise<number>
   return Number.isNaN(ms) ? 0 : ms
 }
 
-// The model and token count are recorded per assistant message. Claude's agent view shows the latest request's
-// input side, i.e. the context the agent carries now, not the summed spend. Read the tail backwards.
-// shortcut: a tail window smaller than the last tool result yields no model or tokens.
-async function agentUsage($: EngineInterface, path: string): Promise<{ model: string; tokens: number | undefined }> {
+// The model, effort and token count are recorded per assistant message. Claude's agent view shows the latest
+// request's input side, i.e. the context the agent carries now, not the summed spend. Read the tail backwards.
+// shortcut: a tail window smaller than the last tool result yields no model, effort or tokens.
+async function agentUsage(
+  $: EngineInterface,
+  path: string,
+): Promise<{ model: string; tokens: number | undefined; effort: string }> {
   const out = await tailText($, path)
-  if (out === undefined) return { model: '', tokens: undefined }
+  if (out === undefined) return { model: '', tokens: undefined, effort: '' }
   const lines = out.split('\n')
   let model: string | undefined
   let tokens: number | undefined
-  for (let i = lines.length - 1; i >= 0 && (model === undefined || tokens === undefined); i -= 1) {
+  let effort: string | undefined
+  for (let i = lines.length - 1; i >= 0 && (model === undefined || tokens === undefined || effort === undefined); i -= 1) {
     if (!lines[i].includes('"model"')) continue
     try {
-      const message = JSON.parse(lines[i]).message
+      const record = JSON.parse(lines[i])
+      const message = record.message
       if (model === undefined && typeof message?.model === 'string' && message.model !== '<synthetic>') {
         model = message.model
       }
@@ -941,11 +948,15 @@ async function agentUsage($: EngineInterface, path: string): Promise<{ model: st
         tokens = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) +
           (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0)
       }
+      if (effort === undefined && record?.type === 'assistant') {
+        const value = record.perTurnEffort ?? record.effort
+        if (typeof value === 'string' && value !== '') effort = value
+      }
     } catch {
       // the window may start mid-line
     }
   }
-  return { model: model ?? '', tokens }
+  return { model: model ?? '', tokens, effort: effort ?? '' }
 }
 
 // The tool an agent started last, finished or not: most tools are shorter than the pane's refresh, so an
@@ -1677,13 +1688,15 @@ export const register: Register = on => {
     const act = await lastActivity($, runs).catch(() => undefined)
     const dir = await sessionDir($).catch(() => '')
     const modelText = new Map<string, string>()
+    const effortText = new Map<string, string>()
     const tokenText = new Map<string, string>()
     const startedAt = new Map<string, number>()
     const toolText = new Map<string, string>()
     for (const a of rows) {
       const path = `${dir}/subagents/agent-${a.id}.jsonl`
-      const { model, tokens } = await agentUsage($, path)
+      const { model, tokens, effort } = await agentUsage($, path)
       if (model !== '') modelText.set(a.id, ` · ${model}`)
+      if (effort !== '') effortText.set(a.id, ` · ${effort}`)
       if (tokens !== undefined) tokenText.set(a.id, ` · ${tokenCount(tokens)} tokens`)
       const started = await agentStart($, path)
       if (started > 0) startedAt.set(a.id, started)
@@ -1732,6 +1745,7 @@ export const register: Register = on => {
                       {' · '}
                       {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
                       {modelText.get(a.id) ?? ''}
+                      {effortText.get(a.id) ?? ''}
                       {' · '}
                     </Text>
                     <Text color={state} dimColor={state === undefined}>{a.status}</Text>
@@ -1799,7 +1813,7 @@ export const register: Register = on => {
                           <Text dimColor>{'- '}</Text>
                           <Text bold>{a.label}</Text>
                           <Text dimColor>
-                            {[a.model, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
+                            {[a.model, a.effort, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
                               .filter(Boolean)
                               .map(part => ` · ${part}`)
                               .join('')}
