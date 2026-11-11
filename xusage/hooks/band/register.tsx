@@ -561,7 +561,9 @@ let agents: { at: number; list: AgentEntry[] } | undefined
 async function agentList($: EngineInterface): Promise<AgentEntry[]> {
   const now = await $.clock.now()
   if (agents !== undefined && now - agents.at < 3_000) return agents.list
-  const list = (await $.agent.list().catch(() => [])) as AgentEntry[]
+  // A failed listing says nothing about the agents; an empty one would blank them for a whole window.
+  const list = await $.agent.list().catch(() => undefined)
+  if (list === undefined) return agents?.list ?? []
   const value = Array.isArray(list) ? list : []
   agents = { at: now, list: value }
   return value
@@ -784,15 +786,19 @@ async function taskIdMap($: EngineInterface, dir: string, names: readonly string
   return map
 }
 
-// The run dirs holding a .jsonl written within STALE_MS.
-async function recentRuns($: EngineInterface, dir: string, now: number): Promise<Set<string>> {
+// The run dirs holding a .jsonl written within STALE_MS; undefined when the scan itself failed, since an
+// unreadable listing is not an empty one and must not blank the pane.
+async function recentRuns($: EngineInterface, dir: string, now: number): Promise<Set<string> | undefined> {
   const root = `${dir}/subagents/workflows`
   if (await onWindows($)) {
     // No find: one listing per run dir, which carries each file's mtime without a stat.
+    const runs = await $.fs.list(root).catch(() => undefined)
+    if (runs === undefined) return undefined
     const names = new Set<string>()
-    for (const run of await $.fs.list(root).catch(() => [])) {
+    for (const run of runs) {
       if (run.kind !== 'dir') continue
-      const files = await $.fs.list(`${root}/${run.name}`).catch(() => [])
+      const files = await $.fs.list(`${root}/${run.name}`).catch(() => undefined)
+      if (files === undefined) return undefined
       if (files.some(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= STALE_MS)) {
         names.add(run.name)
       }
@@ -803,8 +809,9 @@ async function recentRuns($: EngineInterface, dir: string, now: number): Promise
   const recent = await $.process
     .run(['/usr/bin/find', root, '-mindepth', '2', '-maxdepth', '2', '-name', '*.jsonl', '-mmin', `-${STALE_MS / 60_000}`])
     .catch(() => undefined)
+  if (recent === undefined || recent.exitCode !== 0) return undefined
   return new Set(
-    (recent?.stdout ?? '').split('\n').flatMap(path => {
+    recent.stdout.split('\n').flatMap(path => {
       const parts = path.split('/')
       return parts.length < 2 ? [] : [parts[parts.length - 2]]
     }),
@@ -814,14 +821,32 @@ async function recentRuns($: EngineInterface, dir: string, now: number): Promise
 async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
   const now = await $.clock.now()
   if (workflows !== undefined && now - workflows.at < 3_000) return workflows.list
-  const dir = await sessionDir($)
-  const names = await recentRuns($, dir, now)
+  const prev = workflows?.list ?? []
+  const prevById = new Map(prev.map(w => [w.id, w]))
+  // A failed read says nothing about a run, so the last good row stays; only a positive signal drops it.
   const list: WorkflowRun[] = []
+  const keep = (name: string) => {
+    const old = prevById.get(name)
+    if (old !== undefined) list.push(old)
+  }
+  const dir = await sessionDir($).catch(() => '')
+  if (dir === '') {
+    workflows = { at: now, list: prev }
+    return prev
+  }
+  const names = await recentRuns($, dir, now)
+  if (names === undefined) {
+    workflows = { at: now, list: prev }
+    return prev
+  }
   for (const name of names) {
     const root = `${dir}/subagents/workflows/${name}`
     const journal = `${root}/journal.jsonl`
     const journalAt = await mtime($, journal)
-    if (journalAt === 0) continue
+    if (journalAt === 0) {
+      keep(name)
+      continue
+    }
     // A resumed run keeps its id and appends to the old journal while the previous run's final JSON stays put,
     // so the run is over only once that JSON is at least as new as the journal.
     if ((await mtime($, `${dir}/workflows/${name}.json`)) >= journalAt) continue
@@ -835,12 +860,19 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       earliest = Math.min(earliest, time)
       if (f.name.endsWith('.jsonl')) at = Math.max(at, time)
     }
+    if (at === 0) {
+      keep(name)
+      continue
+    }
     if (now - at > STALE_MS) continue
     // Result lines carry the agent's whole output, so only their keys are read; started/failed lines are small and
     // read in journal order, since a failed attempt may be retried under the same key.
     const events = await grepFile($, journal, '"type":"(started|failed)"').catch(() => undefined)
     const results = await grepFile($, journal, '"type":"result","key":"[^"]*"', true).catch(() => undefined)
-    if (events === undefined) continue
+    if (events === undefined || results === undefined) {
+      keep(name)
+      continue
+    }
     const done = new Set(
       (results ?? '').split('\n').flatMap(line => {
         const at = line.indexOf('"key":"')
@@ -1567,7 +1599,8 @@ export const register: Register = on => {
     const stack = (mine: NonNullable<typeof below>) =>
       below ? <Box flexDirection="column">{mine}{below}</Box> : mine
 
-    const now = await $.clock.now()
+    // One unreadable value must not take the whole band down with it.
+    const now = await $.clock.now().catch(() => Date.now())
     let u: Usage
     try {
       u = await usage($)
@@ -1583,7 +1616,7 @@ export const register: Register = on => {
     const contextText = `${contextLabel}${compact.text}`
     // The auto-compact window is the real pressure point, unlike the 70/90 quota thresholds.
     const contextHot = typeof context?.tokens === 'number' && compact.at !== undefined && context.tokens >= compact.at
-    const agentRows = await liveAgents($)
+    const agentRows = await liveAgents($).catch(() => [])
     const active = agentRows.length
     const wf = await runningWorkflows($).catch(() => [])
     const wfAgents = wf.reduce((n, w) => n + w.agents.length, 0)
@@ -1629,7 +1662,7 @@ export const register: Register = on => {
 
     const shownPlan = u.source === 'proxy'
       ? `proxy${u.plan ? ` ${u.plan}` : ''}`
-      : (await currentPlan($, u.plan)) || 'claude'
+      : (await currentPlan($, u.plan).catch(() => u.plan)) || 'claude'
 
     return stack(
       // No width: the band stretches the row, and bodyColumns does not match the webview's width.
@@ -1681,10 +1714,11 @@ export const register: Register = on => {
         })()
       }, 3_000)
     }
-    const rows = await liveAgents($)
+    // Each section fails on its own: a missing read hides that section, never the whole pane.
+    const rows = await liveAgents($).catch(() => [])
     const runs = await runningWorkflows($).catch(() => [])
     const bg = await bgTasks($).catch(() => [])
-    const now = await $.clock.now()
+    const now = await $.clock.now().catch(() => Date.now())
     const act = await lastActivity($, runs).catch(() => undefined)
     const dir = await sessionDir($).catch(() => '')
     const modelText = new Map<string, string>()

@@ -576,6 +576,122 @@ test('titles a running workflow with its script meta and names it by task id', a
   }
 })
 
+test('keeps last-known-good rows when a pane read fails', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(12))
+  const session = 'sess-keep'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_keep')
+  mkdirSync(root, { recursive: true })
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    `${JSON.stringify({ type: 'started', key: 'S1', agentId: 'a1', label: 'keeper', phase: 'S1' })}\n`,
+  )
+  await Bun.write(
+    join(root, 'agent-a1.jsonl'),
+    `${JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(env.now() - 60_000).toISOString(),
+      message: { model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 2 } },
+    })}\n`,
+  )
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  let failScan = false
+  let failJournal = false
+  let failAgents = false
+  let pane: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    process: {
+      run: async (command: string[]) => {
+        if (failScan && command[0] === '/usr/bin/find' && command.some(arg => arg.endsWith('/subagents/workflows'))) {
+          throw new Error('scan failed')
+        }
+        if (failJournal && command[0] === '/usr/bin/grep' && command[command.length - 1].endsWith('/journal.jsonl')) {
+          throw new Error('journal read failed')
+        }
+        return await env.$.process.run(command)
+      },
+    },
+    agent: {
+      list: async () => {
+        if (failAgents) throw new Error('agent list failed')
+        return [{ id: 'b1', description: 'Direct worker', type: 'local_agent', status: 'running' }]
+      },
+    },
+    fs: {
+      ...env.$.fs,
+      exists: async (path: string) => existsSync(path),
+      list: async (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work' },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+  const frame = async () => {
+    env.advance(3_100)
+    return text(await pane($, { requestId: 'usage-band-agents' }, async () => undefined))
+  }
+
+  try {
+    const first = await frame()
+    expect(first).toContain('Workflows (1)')
+    expect(first).toContain('keeper')
+    expect(first).toContain('Agents (1)')
+    expect(first).toContain('Direct worker')
+
+    failScan = true
+    const noScan = await frame()
+    expect(noScan).toContain('Workflows (1)')
+    expect(noScan).toContain('keeper')
+    failScan = false
+
+    failJournal = true
+    const noJournal = await frame()
+    expect(noJournal).toContain('Workflows (1)')
+    expect(noJournal).toContain('keeper')
+    failJournal = false
+
+    failAgents = true
+    const noAgents = await frame()
+    expect(noAgents).toContain('Agents (1)')
+    expect(noAgents).toContain('Direct worker')
+    expect(noAgents).toContain('Workflows (1)')
+    failAgents = false
+
+    const healed = await frame()
+    expect(healed).toContain('Workflows (1)')
+    expect(healed).toContain('keeper')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
+
 test('names the last tool a live agent started', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
