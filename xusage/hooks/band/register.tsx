@@ -1634,7 +1634,7 @@ export const register: Register = on => {
     }
     return (
       // No width: bodyColumns is narrower than the webview pane, so lines would truncate mid-pane.
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} paddingX={1}>
         {rows.length === 0 ? (
           <Text dimColor>
             {runs.length > 0
