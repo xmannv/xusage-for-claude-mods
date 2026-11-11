@@ -1129,6 +1129,56 @@ test('recovers a launch past the capped grep output from the transcript tail', a
   }
 })
 
+test('finds a foreground command the host moved to the background after its timeout', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-timeout'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-timeout')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const timeout = 600_000
+  const now = boot + 1_080_000
+  const output = join(tasks, 'bauto123.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  const launch = [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(boot).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'tu-timeout',
+          name: 'Bash',
+          input: { command: 'bash export4.sh', description: 'Export report', timeout: timeout * 6 },
+        }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: new Date(boot + timeout).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tu-timeout',
+          content: `Command did not complete within its ${timeout / 1000}s timeout and was moved to the background (ID: bauto123). Output is being written to: ${output}. You will be notified when it completes.`,
+        }],
+      },
+    }),
+  ].join('\n')
+  await Bun.write(`${dir}.jsonl`, `${launch}\n`)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [output] })
+  try {
+    const rendered = await harness.render()
+    expect(paneText(rendered)).toContain('Background (1)')
+    expect(paneText(rendered)).toContain('Export report')
+    expect(paneText(rendered)).toContain('bauto123 · started: 18m · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps reading a capped refresh instead of skipping to the end of the file', async () => {
   const env = engine(async () => ok(12))
   const session = 'sess-bg-grow'

@@ -1037,7 +1037,7 @@ type BgState = {
   session: string
   open: Map<string, BgOpen>
   closed: Set<string>
-  tools: Map<string, { label: string; command: string }>
+  tools: Map<string, { label: string; command: string; at: number }>
   main: BgFile
   files: Map<string, BgFile>
   backfilled: boolean
@@ -1055,9 +1055,18 @@ const BG_KEEP_MS = 24 * 60 * 60_000
 // would only resurface as a stale row the user cannot act on.
 const BOOT_MS = Date.now()
 const BG_PROBE_MAX = 64
-const BG_ANCHOR = '"run_in_background":true|Command running in background with ID:|<task-id>|"name":"TaskStop"'
+const BG_ANCHOR =
+  '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"|"name":"Bash"'
+// The prefilter only decides which subagent transcripts to read, and a file with a launch always names one of
+// these; including every Bash tool_use here would mark nearly every transcript.
+const BG_PRESCAN =
+  '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"'
 const BG_LAUNCH =
   /Command running in background with ID: ([A-Za-z0-9]+)\. Output is being written to: ([\s\S]+?)\. You will be notified/
+// A foreground command the host gives up on is backgrounded after a timeout; the tool_use carries no
+// run_in_background flag and can be many minutes older than this result.
+const BG_TIMEOUT =
+  /Command did not complete within its [^.]* timeout and was moved to the background \(ID: ([A-Za-z0-9]+)\)\./
 
 let bgCache: { at: number; list: BgTask[] } | undefined
 let bgState: BgState | undefined
@@ -1084,8 +1093,10 @@ function bgParse(text: string, state: BgState) {
     if (
       !line.includes('run_in_background') &&
       !line.includes('Command running in background with ID:') &&
+      !line.includes('was moved to the background') &&
       !line.includes('<task-id>') &&
-      !line.includes('TaskStop')
+      !line.includes('TaskStop') &&
+      !line.includes('"name":"Bash"')
     ) continue
     let record: any
     try {
@@ -1098,10 +1109,12 @@ function bgParse(text: string, state: BgState) {
       if (!Array.isArray(content)) continue
       for (const block of content) {
         if (block?.type !== 'tool_use' || typeof block.id !== 'string') continue
-        if (block.name === 'Bash' && block.input?.run_in_background === true) {
+        if (block.name === 'Bash') {
+          const at = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
           state.tools.set(block.id, {
-            label: typeof block.input.description === 'string' ? block.input.description : '',
-            command: typeof block.input.command === 'string' ? block.input.command : '',
+            label: typeof block.input?.description === 'string' ? block.input.description : '',
+            command: typeof block.input?.command === 'string' ? block.input.command : '',
+            at: Number.isNaN(at) ? 0 : at,
           })
         } else if (block.name === 'TaskStop' && typeof block.input?.task_id === 'string') {
           bgClose(state, block.input.task_id)
@@ -1119,13 +1132,15 @@ function bgParse(text: string, state: BgState) {
           : Array.isArray(block.content)
             ? block.content.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('')
             : ''
-        const hit = BG_LAUNCH.exec(body)
-        if (hit === null) continue
-        const id = hit[1]
+        const hit = BG_LAUNCH.exec(body.replace(BG_TIMEOUT, 'Command running in background with ID: $1.'))
         const tool = typeof block.tool_use_id === 'string' ? state.tools.get(block.tool_use_id) : undefined
         if (typeof block.tool_use_id === 'string') state.tools.delete(block.tool_use_id)
+        if (hit === null) continue
+        const id = hit[1]
         if (state.closed.has(id) || state.open.has(id)) continue
-        const started = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
+        const started = tool !== undefined && tool.at > 0
+          ? tool.at
+          : typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
         state.open.set(id, {
           id,
           label: tool?.label.trim() || tool?.command.split('\n')[0].trim() || id,
@@ -1154,13 +1169,14 @@ async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, sta
   if (!file.seeded) {
     const before = await $.fs.stat(path).catch(() => undefined)
     if (before === undefined) return
+    // The host caps a process's stdout (~4 MiB), which on a long transcript cuts the newest anchors off, so the
+    // newest slice is parsed first and again from the cap-surviving grep output. Re-parsing a line is idempotent,
+    // and the tail carries the matching tool_use for an auto-backgrounded launch.
+    const tail = await readFrom($, path, Math.max(0, before.size - TAIL_BYTES)).catch(() => undefined)
+    if (tail !== undefined) bgParse(tail, state)
     const text = await grepFile($, path, BG_ANCHOR).catch(() => undefined)
     if (text === undefined) return
     bgParse(text, state)
-    // The host caps a process's stdout (~4 MiB), which on a long transcript cuts the newest anchors off, so the
-    // launches made since the last scan are read again from the tail. Re-parsing a line is idempotent.
-    const tail = await readFrom($, path, Math.max(0, before.size - TAIL_BYTES)).catch(() => undefined)
-    if (tail !== undefined) bgParse(tail, state)
     file.seeded = true
     file.offset = before.size
     file.carry = ''
@@ -1214,7 +1230,7 @@ async function bgPrefilter($: EngineInterface, files: readonly string[]): Promis
   const hits = new Set<string>()
   for (let i = 0; i < files.length; i += 200) {
     const run = await $.process
-      .run(['/usr/bin/grep', '-l', '-E', BG_ANCHOR, ...files.slice(i, i + 200)])
+      .run(['/usr/bin/grep', '-l', '-E', BG_PRESCAN, ...files.slice(i, i + 200)])
       .catch(() => undefined)
     if (run === undefined || run.exitCode > 1) continue
     for (const line of run.stdout.split('\n')) if (line !== '') hits.add(line)
