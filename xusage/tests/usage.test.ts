@@ -1099,6 +1099,38 @@ test('finds background tasks under the resumed conversation id', async () => {
   }
 })
 
+test('ignores a title stub at the runtime session id', async () => {
+  const env = engine(async () => ok(12))
+  const runtime = 'runtime-stub'
+  const conversation = 'fb281c7b-0000-4000-8000-000000000001'
+  const project = join(env.root, 'projects', '-tmp-work')
+  const dir = join(project, conversation)
+  mkdirSync(dir, { recursive: true })
+  mkdirSync(join(project, runtime), { recursive: true })
+  await Bun.write(join(project, runtime, 'custom-title.json'), '{"customTitle":"COTUONG"}')
+  await Bun.write(
+    `${join(project, runtime)}.jsonl`,
+    JSON.stringify({ type: 'custom-title', customTitle: 'COTUONG', sessionId: runtime }),
+  )
+  const tasks = join(env.root, 'bg-stub')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 30_000
+  const output = join(tasks, 'bstub123.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  await Bun.write(`${dir}.jsonl`, `${bgLaunch('tu1', 'bstub123', output, 'Behind the stub', boot, { session_id: runtime })}\n`)
+  const harness = await paneHarness(env, { session: runtime, now: () => now, alive: [output] })
+  try {
+    const rendered = await harness.render()
+    expect(paneText(rendered)).toContain('Background (1)')
+    expect(paneText(rendered)).toContain('Behind the stub')
+    expect(paneText(rendered)).toContain('bstub123 · started: 30s · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
 // 700 progress lines carry the anchor, so grep's ~4 MiB-shaped stdout cap (here 300 kB) fills before the launch.
 const bgFiller = Array.from(
   { length: 700 },

@@ -640,7 +640,8 @@ let sessionDirCache: { session: string; dir: string } | undefined
 
 // /resume inside a session launched with another id keeps that launch id as the live session id while the
 // transcript, its subagents and its workflows stay under the resumed conversation's id. The live file is the
-// recent one whose tail names the runtime id; the folder lookup above cannot see that.
+// recent one whose records name the runtime id; the folder lookup above cannot see that. A custom-title stub
+// can sit at the runtime id's path without being the transcript, so only a record marker counts.
 async function resumedDir(
   $: EngineInterface,
   projects: string,
@@ -648,6 +649,7 @@ async function resumedDir(
   session: string,
 ): Promise<string | undefined> {
   const now = await $.clock.now()
+  const marker = `"session_id":"${session}"`
   const files: { path: string; mtimeMs: number }[] = []
   const seen = new Set<string>()
   for (const root of [folder, ...(await $.fs.list(projects).catch(() => [])).map(p => `${projects}/${p.name}`)]) {
@@ -662,9 +664,19 @@ async function resumedDir(
   files.sort((a, b) => b.mtimeMs - a.mtimeMs)
   for (const file of files) {
     const tail = await tailText($, file.path).catch(() => undefined)
-    if (tail !== undefined && tail.includes(session)) return file.path.slice(0, -'.jsonl'.length)
+    if (tail !== undefined && tail.includes(marker)) return file.path.slice(0, -'.jsonl'.length)
   }
   return undefined
+}
+
+// A title stub holds no records; treating it as the session transcript hides everything under the real one.
+async function transcriptRecords($: EngineInterface, base: string): Promise<boolean> {
+  const path = `${base}.jsonl`
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat === undefined) return false
+  if (stat.size > READ_LIMIT) return true
+  const text = await $.fs.read(path).catch(() => '')
+  return text === '' || /"type":"(user|assistant)"/.test(text)
 }
 
 async function sessionDir($: EngineInterface): Promise<string> {
@@ -675,14 +687,12 @@ async function sessionDir($: EngineInterface): Promise<string> {
   const start = await $.session.root().catch(() => $.session.cwd())
   const folder = `${projects}/${start.replace(/[^a-zA-Z0-9]/g, '-')}`
   const encoded = `${folder}/${session}`
-  const found = async (base: string) =>
-    (await $.fs.exists(base).catch(() => false)) || (await $.fs.exists(`${base}.jsonl`).catch(() => false))
   let dir: string | undefined = encoded
-  if (!(await found(encoded))) {
+  if (!(await transcriptRecords($, encoded))) {
     dir = undefined
     for (const p of await $.fs.list(projects).catch(() => [])) {
       const candidate = `${projects}/${p.name}/${session}`
-      if (await found(candidate)) {
+      if (await transcriptRecords($, candidate)) {
         dir = candidate
         break
       }
@@ -1056,10 +1066,6 @@ const BG_KEEP_MS = 24 * 60 * 60_000
 const BOOT_MS = Date.now()
 const BG_PROBE_MAX = 64
 const BG_ANCHOR =
-  '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"|"name":"Bash"'
-// The prefilter only decides which subagent transcripts to read, and a file with a launch always names one of
-// these; including every Bash tool_use here would mark nearly every transcript.
-const BG_PRESCAN =
   '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"'
 const BG_LAUNCH =
   /Command running in background with ID: ([A-Za-z0-9]+)\. Output is being written to: ([\s\S]+?)\. You will be notified/
@@ -1169,17 +1175,22 @@ async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, sta
   if (!file.seeded) {
     const before = await $.fs.stat(path).catch(() => undefined)
     if (before === undefined) return
-    // The host caps a process's stdout (~4 MiB), which on a long transcript cuts the newest anchors off, so the
-    // newest slice is parsed first and again from the cap-surviving grep output. Re-parsing a line is idempotent,
-    // and the tail carries the matching tool_use for an auto-backgrounded launch.
+    // The tail carries the newest launches and the matching tool_use for an auto-backgrounded one, so it is
+    // parsed before anything else; re-parsing a line is idempotent.
     const tail = await readFrom($, path, Math.max(0, before.size - TAIL_BYTES)).catch(() => undefined)
     if (tail !== undefined) bgParse(tail, state)
-    const text = await grepFile($, path, BG_ANCHOR).catch(() => undefined)
-    if (text === undefined) return
-    bgParse(text, state)
     file.seeded = true
     file.offset = before.size
     file.carry = ''
+    // The newest slice already holds current launches; a transcript of hundreds of MB takes tens of seconds to
+    // grep whole and the host caps that stdout anyway, so older hits merge in off the render path.
+    void grepFile($, path, BG_ANCHOR)
+      .then(text => {
+        if (text === undefined) return
+        bgParse(text, state)
+        bgCache = undefined
+      })
+      .catch(() => undefined)
     return
   }
   if (stat.size === file.offset) return
@@ -1230,7 +1241,7 @@ async function bgPrefilter($: EngineInterface, files: readonly string[]): Promis
   const hits = new Set<string>()
   for (let i = 0; i < files.length; i += 200) {
     const run = await $.process
-      .run(['/usr/bin/grep', '-l', '-E', BG_PRESCAN, ...files.slice(i, i + 200)])
+      .run(['/usr/bin/grep', '-l', '-E', BG_ANCHOR, ...files.slice(i, i + 200)])
       .catch(() => undefined)
     if (run === undefined || run.exitCode > 1) continue
     for (const line of run.stdout.split('\n')) if (line !== '') hits.add(line)
