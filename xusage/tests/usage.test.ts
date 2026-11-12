@@ -576,6 +576,107 @@ test('titles a running workflow with its script meta and names it by task id', a
   }
 })
 
+test('titles a saved workflow whose script has no run id', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(12))
+  const session = 'sess-saved'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_saved')
+  mkdirSync(root, { recursive: true })
+  const agentAt = new Date(env.now() - 305_000)
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    `${JSON.stringify({ type: 'started', key: 'v2:1', agentId: 'a1', label: 'impl:0', phase: 'Tasks' })}\n`,
+  )
+  await Bun.write(
+    join(root, 'agent-a1.jsonl'),
+    `${JSON.stringify({
+      type: 'assistant',
+      timestamp: agentAt.toISOString(),
+      message: { model: 'claude-opus-5-5', usage: { input_tokens: 10, output_tokens: 2 } },
+    })}\n`,
+  )
+  utimesSync(join(root, 'agent-a1.jsonl'), agentAt, agentAt)
+  // A saved workflow keeps one script per definition, with no run-id suffix; the launch result names it.
+  await Bun.write(
+    `${dir}.jsonl`,
+    `${JSON.stringify({
+      type: 'user',
+      toolUseResult: {
+        status: 'async_launched',
+        taskId: 'w9f9oj61k',
+        taskType: 'local_workflow',
+        workflowName: 'kitrs-r9-close-execute',
+        runId: 'wf_saved',
+        summary: 'Execute the R9 close',
+        scriptPath: `${dir}/workflows/scripts/kitrs-r9-close-execute.js`,
+      },
+    })}\n`,
+  )
+  mkdirSync(join(dir, 'workflows', 'scripts'), { recursive: true })
+  const script = join(dir, 'workflows', 'scripts', 'kitrs-r9-close-execute.js')
+  await Bun.write(
+    script,
+    [
+      'export const meta = {',
+      "  name: 'kitrs-r9-close-execute',",
+      "  description: 'Execute the R9 close: implement, review, fix loop per task',",
+      "  phases: [{ title: 'Tasks' }, { title: 'Final review' }],",
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const daysOld = new Date(Date.now() - 3 * 24 * 60 * 60_000)
+  utimesSync(script, daysOld, daysOld)
+  let pane: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'Pane') pane = handler
+    return registration
+  })
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const $ = {
+    ...env.$,
+    agent: { list: async () => [] },
+    fs: {
+      ...env.$.fs,
+      exists: async (path: string) => existsSync(path),
+      list: async (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map(entry => ({
+          name: entry.name,
+          kind: entry.isDirectory() ? 'dir' : 'file',
+          mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
+        })),
+    },
+    session: { id: async () => session, root: async () => '/tmp/work', cwd: async () => '/tmp/work' },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      close: async () => undefined,
+      panes: async () => [],
+      invalidate: async () => undefined,
+    },
+  }
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+
+  try {
+    const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
+    expect(text(rendered)).toContain('Execute the R9 close: implement, review, fix loop per task')
+    expect(text(rendered)).toContain('w9f9oj61k · 1 running · started: 5m')
+    expect(text(rendered)).toContain('impl:0')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})
+
 test('keeps last-known-good rows when a pane read fails', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))

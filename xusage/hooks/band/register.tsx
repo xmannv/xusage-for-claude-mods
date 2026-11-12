@@ -740,15 +740,19 @@ async function workflowInfo(
   $: EngineInterface,
   dir: string,
   name: string,
+  workflow = '',
 ): Promise<{ title: string; startedAt: number }> {
   const scripts = await $.fs.list(`${dir}/workflows/scripts`).catch(() => [])
-  const script = scripts.find(f => f.kind === 'file' && f.name.endsWith(`-${name}.js`))
-  if (script === undefined) return { title: name, startedAt: 0 }
+  // An inline script is saved per run under a run-id suffix; a saved workflow keeps one file per definition.
+  const own = scripts.find(f => f.kind === 'file' && f.name.endsWith(`-${name}.js`))
+  const script = own ?? (workflow === '' ? undefined : scripts.find(f => f.kind === 'file' && f.name === `${workflow}.js`))
+  if (script === undefined) return { title: workflow !== '' ? workflow : name, startedAt: 0 }
   const path = `${dir}/workflows/scripts/${script.name}`
   const source = await $.fs.read(path).catch(() => '')
   return {
-    title: metaString(source, 'description') || metaString(source, 'name') || name,
-    startedAt: await mtime($, path),
+    title: metaString(source, 'description') || metaString(source, 'name') || (workflow !== '' ? workflow : name),
+    // A shared definition's mtime is its own, not this run's start; 0 falls back to the run dir's oldest file.
+    startedAt: own === undefined ? 0 : await mtime($, path),
   }
 }
 
@@ -765,13 +769,14 @@ async function agentStart($: EngineInterface, path: string): Promise<number> {
 // result is the one place the pair sits together, so a run launched before the pane looked needs a transcript scan.
 // A miss is retried only after a pause: the result is written just after the run dir and may not be there yet.
 const TASK_SCAN_MS = 30_000
-let taskIds: { at: number; map: Map<string, string> } | undefined
+type RunNames = { task: string; workflow: string }
+let taskIds: { at: number; map: Map<string, RunNames> } | undefined
 
-async function taskIdMap($: EngineInterface, dir: string, names: readonly string[]): Promise<Map<string, string>> {
+async function taskIdMap($: EngineInterface, dir: string, names: readonly string[]): Promise<Map<string, RunNames>> {
   if (taskIds !== undefined && names.every(name => taskIds?.map.has(name))) return taskIds.map
   const now = await $.clock.now()
   if (taskIds !== undefined && now - taskIds.at < TASK_SCAN_MS) return taskIds.map
-  const map = taskIds?.map ?? new Map<string, string>()
+  const map = taskIds?.map ?? new Map<string, RunNames>()
   const found = await grepFile(
     $,
     `${dir}.jsonl`,
@@ -780,7 +785,9 @@ async function taskIdMap($: EngineInterface, dir: string, names: readonly string
   ).catch(() => undefined)
   for (const line of (found ?? '').split('\n')) {
     const pair = /^"taskId":"([^"]+)".*"runId":"([^"]+)"$/.exec(line)
-    if (pair !== null) map.set(pair[2], pair[1])
+    if (pair === null) continue
+    const workflow = /"workflowName":"([^"]*)"/.exec(line)?.[1] ?? ''
+    map.set(pair[2], { task: pair[1], workflow })
   }
   taskIds = { at: now, map }
   return map
@@ -839,6 +846,8 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     workflows = { at: now, list: prev }
     return prev
   }
+  // One transcript scan names every run and tells a saved workflow's script apart from a per-run inline one.
+  const tasks = names.size === 0 ? undefined : await taskIdMap($, dir, [...names]).catch(() => undefined)
   for (const name of names) {
     const root = `${dir}/subagents/workflows/${name}`
     const journal = `${root}/journal.jsonl`
@@ -914,9 +923,11 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
         tool: path === undefined ? undefined : await agentTool($, path),
       })
     }
-    const info = await workflowInfo($, dir, name)
+    const launch = tasks?.get(name)
+    const info = await workflowInfo($, dir, name, launch?.workflow ?? '')
     list.push({
       id: name,
+      task: launch?.task,
       title: info.title,
       startedAt: info.startedAt > 0 ? info.startedAt : earliest,
       at,
@@ -924,10 +935,6 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       done: done.size,
       failed: failed.size,
     })
-  }
-  if (list.length > 0) {
-    const tasks = await taskIdMap($, dir, list.map(w => w.id)).catch(() => undefined)
-    for (const w of list) w.task = tasks?.get(w.id) || undefined
   }
   workflows = { at: now, list }
   return list
