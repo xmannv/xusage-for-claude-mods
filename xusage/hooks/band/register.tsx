@@ -1640,6 +1640,7 @@ export const register: Register = on => {
         .open({
           id: AGENTS_PANE,
           title: 'Agents',
+          backgroundColor: 'transparent',
           focus: true,
           closeOnEscape: true,
           rows: Math.min(20, totalAgents + 2 * wf.length + 2 * bg.length + 3),
