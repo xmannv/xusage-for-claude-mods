@@ -1115,6 +1115,9 @@ const BG_KEEP_MS = 24 * 60 * 60_000
 // would only resurface as a stale row the user cannot act on.
 const BOOT_MS = Date.now()
 const BG_PROBE_MAX = 64
+// A whole-transcript grep answers oldest-first and the host caps its stdout, so a launch near the end of a huge
+// transcript never arrives. Reading that many host-sized windows back from the end stays under the cap.
+const BG_BACKFILL_WINDOWS = 16
 const BG_ANCHOR =
   '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"'
 const BG_LAUNCH =
@@ -1232,15 +1235,12 @@ async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, sta
     file.seeded = true
     file.offset = before.size
     file.carry = ''
-    // The newest slice already holds current launches; a transcript of hundreds of MB takes tens of seconds to
-    // grep whole and the host caps that stdout anyway, so older hits merge in off the render path.
-    void grepFile($, path, BG_ANCHOR)
-      .then(text => {
-        if (text === undefined) return
-        bgParse(text, state)
-        bgCache = undefined
-      })
+    // Launches past the tail merge in off the render path.
+    void bgScanBack($, path, before.size)
       .catch(() => undefined)
+      .finally(() => {
+        if (bgState === state) bgCache = undefined
+      })
     return
   }
   if (stat.size === file.offset) return
@@ -1259,6 +1259,28 @@ async function bgRefreshFile($: EngineInterface, path: string, file: BgFile, sta
   // Advance by the bytes actually parsed, not stat.size: a capped stdout leaves the rest for the next refresh.
   file.offset += new TextEncoder().encode(chunk.slice(0, cut - (text.length - chunk.length) + 1)).length
   if (file.offset > stat.size) file.offset = stat.size
+}
+
+// The scan starts at most 16 host-sized windows before EOF and reads forward, so a tool_use still pairs with its
+// result; the windows cover the last ~64 MB of the transcript.
+async function bgScanBack($: EngineInterface, path: string, size: number): Promise<void> {
+  const state = bgState
+  if (state === undefined) return
+  let offset = Math.max(0, size - BG_BACKFILL_WINDOWS * READ_LIMIT)
+  let carry = ''
+  for (let i = 0; offset < size && i < BG_BACKFILL_WINDOWS; i += 1) {
+    const window = await readFrom($, path, offset).catch(() => undefined)
+    if (window === undefined || window === '') return
+    offset += new TextEncoder().encode(window).length
+    const text = carry + window
+    const cut = text.lastIndexOf('\n')
+    if (cut < 0) {
+      carry = text
+      continue
+    }
+    carry = text.slice(cut + 1)
+    bgParse(text.slice(0, cut), state)
+  }
 }
 
 // Launches by subagents live only in their own transcripts; the completion notification still lands in the main one.

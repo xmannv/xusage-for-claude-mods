@@ -1380,6 +1380,36 @@ test('recovers a launch past the capped grep output from the transcript tail', a
   }
 })
 
+test('finds a launch pushed past the tail by later output', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-beyond'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-beyond')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 30_000
+  const output = join(tasks, 'bbeyond1.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  // Filler after the launch pushes it past the tail seed; filler before it fills the capped grep stdout.
+  await Bun.write(`${dir}.jsonl`, `${bgFiller}\n${bgLaunch('tu1', 'bbeyond1', output, 'Deep launch', boot)}\n${bgFiller}\n`)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [output], cap: 300_000 })
+  try {
+    let rendered = await harness.render()
+    const deadline = Date.now() + 5_000
+    while (!paneText(rendered).includes('bbeyond1') && Date.now() < deadline) {
+      await Bun.sleep(25)
+      rendered = await harness.render()
+    }
+    expect(paneText(rendered)).toContain('Background (1)')
+    expect(paneText(rendered)).toContain('Deep launch')
+    expect(paneText(rendered)).toContain('bbeyond1 · started: 30s · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('finds a foreground command the host moved to the background after its timeout', async () => {
   const env = engine(async () => ok(12))
   const session = 'sess-bg-timeout'
