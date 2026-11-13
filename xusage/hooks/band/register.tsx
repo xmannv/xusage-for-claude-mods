@@ -1423,10 +1423,10 @@ async function bgBuild($: EngineInterface, state: BgState, now: number): Promise
   const verdict = new Map<string, 'alive' | 'dead' | 'unknown'>()
   for (const task of open) {
     if (task.path === '') {
-      // An MCP task leaves no file to probe; the host's notification or a TaskStop is its only end, so one
-      // launched after this module loaded can only be running, while an older one cannot be confirmed.
+      // An MCP task leaves no file to probe; the host's notification or a TaskStop is its only end, so an open
+      // one is reported running the way the host's own task view does.
       task.at = 0
-      verdict.set(task.id, task.startedAt >= BOOT_MS ? 'alive' : 'unknown')
+      verdict.set(task.id, 'alive')
       continue
     }
     const stat = await $.fs.stat(task.path).catch(() => undefined)
@@ -1450,11 +1450,11 @@ async function bgBuild($: EngineInterface, state: BgState, now: number): Promise
           ? 'stale'
           : 'unknown'
     if (status === 'stale' || status === 'unknown') {
-      // A shell from a previous supervisor cannot have survived a restart; a pathless task has no probe, so it
-      // stays visible as unverified for its keep window instead of vanishing on a plugin reload.
       if (task.path !== '' && task.startedAt < BOOT_MS) continue
       if (now - Math.max(task.at, task.startedAt) > BG_KEEP_MS) continue
     }
+    // A task with no notification can linger after a session that died; the keep window is its only bound.
+    if (task.path === '' && now - task.startedAt > BG_KEEP_MS) continue
     list.push({ ...task, status })
   }
   list.sort((a, b) => BG_RANK[a.status] - BG_RANK[b.status] || b.startedAt - a.startedAt)

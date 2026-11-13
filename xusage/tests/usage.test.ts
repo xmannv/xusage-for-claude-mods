@@ -1415,40 +1415,40 @@ test('shows an MCP call the host moved to a background task', async () => {
   const session = 'sess-bg-mcp'
   const dir = join(env.root, 'projects', '-tmp-work', session)
   mkdirSync(dir, { recursive: true })
-  let now = Date.now()
-  const harness = await paneHarness(env, { session, now: () => now, alive: [] })
+  // Started before the module loads, the way a pane reopened mid-task sees it; the host still calls it working.
+  const started = Date.now() - 2_000
+  const now = { at: started + 150_000 }
+  const launch = [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(started).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'tu-mcp',
+          name: 'mcp__xermius-mcp__execute_command',
+          input: { host_id: 'h1', command: 'uptime' },
+        }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: new Date(started + 120_000).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tu-mcp',
+          content: [{
+            type: 'text',
+            text: 'MCP tool "xermius-mcp/execute_command" is still running after 120s. It was moved to the background as task kj1031nm5 and keeps running; a notification follows. To stop it, use TaskStop with task_id "kj1031nm5".',
+          }],
+        }],
+      },
+    }),
+  ].join('\n')
+  await Bun.write(`${dir}.jsonl`, `${launch}\n`)
+  const harness = await paneHarness(env, { session, now: () => now.at, alive: [] })
   try {
-    const started = Date.now()
-    const launch = [
-      JSON.stringify({
-        type: 'assistant',
-        timestamp: new Date(started).toISOString(),
-        message: {
-          content: [{
-            type: 'tool_use',
-            id: 'tu-mcp',
-            name: 'mcp__xermius-mcp__execute_command',
-            input: { host_id: 'h1', command: 'uptime' },
-          }],
-        },
-      }),
-      JSON.stringify({
-        type: 'user',
-        timestamp: new Date(started + 120_000).toISOString(),
-        message: {
-          content: [{
-            type: 'tool_result',
-            tool_use_id: 'tu-mcp',
-            content: [{
-              type: 'text',
-              text: 'MCP tool "xermius-mcp/execute_command" is still running after 120s. It was moved to the background as task kj1031nm5 and keeps running; a notification follows. To stop it, use TaskStop with task_id "kj1031nm5".',
-            }],
-          }],
-        },
-      }),
-    ].join('\n')
-    await Bun.write(`${dir}.jsonl`, `${launch}\n`)
-    now = started + 150_000
     const first = paneText(await harness.render())
     expect(first).toContain('Background (1)')
     expect(first).toContain('xermius-mcp/execute_command')
@@ -1460,7 +1460,7 @@ test('shows an MCP call the host moved to a background task', async () => {
         content: '<task-notification>\n<task-id>kj1031nm5</task-id>\n<status>completed</status>\n</task-notification>',
       })}\n`,
     )
-    now = started + 200_000
+    now.at = started + 200_000
     expect(paneText(await harness.render())).not.toContain('Background (1)')
   } finally {
     harness.restore()
