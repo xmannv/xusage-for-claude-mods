@@ -1410,6 +1410,63 @@ test('finds a launch pushed past the tail by later output', async () => {
   }
 })
 
+test('shows an MCP call the host moved to a background task', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-mcp'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  let now = Date.now()
+  const harness = await paneHarness(env, { session, now: () => now, alive: [] })
+  try {
+    const started = Date.now()
+    const launch = [
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: new Date(started).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'tu-mcp',
+            name: 'mcp__xermius-mcp__execute_command',
+            input: { host_id: 'h1', command: 'uptime' },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date(started + 120_000).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tu-mcp',
+            content: [{
+              type: 'text',
+              text: 'MCP tool "xermius-mcp/execute_command" is still running after 120s. It was moved to the background as task kj1031nm5 and keeps running; a notification follows. To stop it, use TaskStop with task_id "kj1031nm5".',
+            }],
+          }],
+        },
+      }),
+    ].join('\n')
+    await Bun.write(`${dir}.jsonl`, `${launch}\n`)
+    now = started + 150_000
+    const first = paneText(await harness.render())
+    expect(first).toContain('Background (1)')
+    expect(first).toContain('xermius-mcp/execute_command')
+    expect(first).toContain('kj1031nm5 · started: 2m · running')
+    await Bun.write(
+      `${dir}.jsonl`,
+      `${launch}\n${JSON.stringify({
+        type: 'queue-operation',
+        content: '<task-notification>\n<task-id>kj1031nm5</task-id>\n<status>completed</status>\n</task-notification>',
+      })}\n`,
+    )
+    now = started + 200_000
+    expect(paneText(await harness.render())).not.toContain('Background (1)')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('finds a foreground command the host moved to the background after its timeout', async () => {
   const env = engine(async () => ok(12))
   const session = 'sess-bg-timeout'

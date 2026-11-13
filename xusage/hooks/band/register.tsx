@@ -1089,6 +1089,7 @@ async function lastActivity($: EngineInterface, runs: WorkflowRun[]): Promise<Ac
   return value
 }
 
+// An MCP task has no output file, so its path stays empty and only a notification or TaskStop can end it.
 type BgStatus = 'starting' | 'running' | 'unknown' | 'stale'
 type BgTask = { id: string; label: string; path: string; startedAt: number; at: number; status: BgStatus }
 type BgOpen = Omit<BgTask, 'status'>
@@ -1126,6 +1127,9 @@ const BG_LAUNCH =
 // run_in_background flag and can be many minutes older than this result.
 const BG_TIMEOUT =
   /Command did not complete within its [^.]* timeout and was moved to the background \(ID: ([A-Za-z0-9]+)\)\./
+// An MCP tool that outlives its foreground wait becomes a task with no output file of its own.
+const BG_MCP =
+  /MCP tool "([^"]+)" is still running after \d+s\. It was moved to the background as task ([A-Za-z0-9]+) and keeps running/
 
 let bgCache: { at: number; list: BgTask[] } | undefined
 let bgState: BgState | undefined
@@ -1155,7 +1159,8 @@ function bgParse(text: string, state: BgState) {
       !line.includes('was moved to the background') &&
       !line.includes('<task-id>') &&
       !line.includes('TaskStop') &&
-      !line.includes('"name":"Bash"')
+      !line.includes('"name":"Bash"') &&
+      !line.includes('"name":"mcp__')
     ) continue
     let record: any
     try {
@@ -1168,14 +1173,18 @@ function bgParse(text: string, state: BgState) {
       if (!Array.isArray(content)) continue
       for (const block of content) {
         if (block?.type !== 'tool_use' || typeof block.id !== 'string') continue
-        if (block.name === 'Bash') {
+        const name = typeof block.name === 'string' ? block.name : ''
+        if (name === 'Bash' || name.startsWith('mcp__')) {
           const at = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
           state.tools.set(block.id, {
-            label: typeof block.input?.description === 'string' ? block.input.description : '',
+            // Only startedAt pairs a background MCP task with its call; the launch text already names the tool.
+            label: name.startsWith('mcp__')
+              ? name.slice('mcp__'.length).replace('__', '/')
+              : typeof block.input?.description === 'string' ? block.input.description : '',
             command: typeof block.input?.command === 'string' ? block.input.command : '',
             at: Number.isNaN(at) ? 0 : at,
           })
-        } else if (block.name === 'TaskStop' && typeof block.input?.task_id === 'string') {
+        } else if (name === 'TaskStop' && typeof block.input?.task_id === 'string') {
           bgClose(state, block.input.task_id)
         }
       }
@@ -1192,18 +1201,19 @@ function bgParse(text: string, state: BgState) {
             ? block.content.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('')
             : ''
         const hit = BG_LAUNCH.exec(body.replace(BG_TIMEOUT, 'Command running in background with ID: $1.'))
+        const mcp = BG_MCP.exec(body)
         const tool = typeof block.tool_use_id === 'string' ? state.tools.get(block.tool_use_id) : undefined
         if (typeof block.tool_use_id === 'string') state.tools.delete(block.tool_use_id)
-        if (hit === null) continue
-        const id = hit[1]
+        if (hit === null && mcp === null) continue
+        const id = hit?.[1] ?? mcp![2]
         if (state.closed.has(id) || state.open.has(id)) continue
         const started = tool !== undefined && tool.at > 0
           ? tool.at
           : typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
         state.open.set(id, {
           id,
-          label: tool?.label.trim() || tool?.command.split('\n')[0].trim() || id,
-          path: hit[2],
+          label: mcp?.[1].trim() || tool?.label.trim() || tool?.command.split('\n')[0].trim() || id,
+          path: hit?.[2] ?? '',
           startedAt: Number.isNaN(started) ? 0 : started,
           at: 0,
         })
@@ -1412,6 +1422,13 @@ async function bgBuild($: EngineInterface, state: BgState, now: number): Promise
   const probe: BgOpen[] = []
   const verdict = new Map<string, 'alive' | 'dead' | 'unknown'>()
   for (const task of open) {
+    if (task.path === '') {
+      // An MCP task leaves no file to probe; the host's notification or a TaskStop is its only end, so one
+      // launched after this module loaded can only be running, while an older one cannot be confirmed.
+      task.at = 0
+      verdict.set(task.id, task.startedAt >= BOOT_MS ? 'alive' : 'unknown')
+      continue
+    }
     const stat = await $.fs.stat(task.path).catch(() => undefined)
     if (stat === undefined) {
       task.at = 0
@@ -1433,7 +1450,9 @@ async function bgBuild($: EngineInterface, state: BgState, now: number): Promise
           ? 'stale'
           : 'unknown'
     if (status === 'stale' || status === 'unknown') {
-      if (task.startedAt < BOOT_MS) continue
+      // A shell from a previous supervisor cannot have survived a restart; a pathless task has no probe, so it
+      // stays visible as unverified for its keep window instead of vanishing on a plugin reload.
+      if (task.path !== '' && task.startedAt < BOOT_MS) continue
       if (now - Math.max(task.at, task.startedAt) > BG_KEEP_MS) continue
     }
     list.push({ ...task, status })
