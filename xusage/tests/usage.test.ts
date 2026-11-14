@@ -1517,6 +1517,58 @@ test('finds a foreground command the host moved to the background after its time
   }
 })
 
+test('shows a command the host set aside to deliver a queued message', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-moved'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-moved')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 240_000
+  const output = join(tasks, 'b0ggt4n6o.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  const text =
+    `Command was moved to the background (ID: b0ggt4n6o) so that a message that arrived while it was running ` +
+    `can reach you; it was not interrupted. Output is being written to: ${output}. You will be notified when ` +
+    `it completes. It is running now: do not start a second copy while it runs. If it is no longer needed, ` +
+    `stop it with TaskStop. To check interim output, use Read on that file path.`
+  const launch = [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: new Date(boot).toISOString(),
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'tu-moved',
+          name: 'Bash',
+          input: {
+            command: 'cat > win-cpu.ps1 <<\'EOF\'\necho hi\nEOF\n',
+            description: 'Measure per-process CPU during Windows flood',
+            timeout: 400_000,
+          },
+        }],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: new Date(boot + 54_000).toISOString(),
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tu-moved', content: text }] },
+    }),
+  ].join('\n')
+  await Bun.write(`${dir}.jsonl`, `${launch}\n`)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [output] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('Background (1)')
+    expect(rendered).toContain('Measure per-process CPU during Windows flood')
+    expect(rendered).toContain('b0ggt4n6o · started: 4m · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps reading a capped refresh instead of skipping to the end of the file', async () => {
   const env = engine(async () => ok(12))
   const session = 'sess-bg-grow'

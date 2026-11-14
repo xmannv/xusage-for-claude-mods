@@ -1127,6 +1127,10 @@ const BG_LAUNCH =
 // run_in_background flag and can be many minutes older than this result.
 const BG_TIMEOUT =
   /Command did not complete within its [^.]* timeout and was moved to the background \(ID: ([A-Za-z0-9]+)\)\./
+// A message that arrives mid-command sets the foreground command aside without interrupting it; the output
+// sentence and path that follow are the standard ones.
+const BG_MOVED =
+  /Command was moved to the background \(ID: ([A-Za-z0-9]+)\)[^.]*\./
 // An MCP tool that outlives its foreground wait becomes a task with no output file of its own.
 const BG_MCP =
   /MCP tool "([^"]+)" is still running after \d+s\. It was moved to the background as task ([A-Za-z0-9]+) and keeps running/
@@ -1200,7 +1204,11 @@ function bgParse(text: string, state: BgState) {
           : Array.isArray(block.content)
             ? block.content.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('')
             : ''
-        const hit = BG_LAUNCH.exec(body.replace(BG_TIMEOUT, 'Command running in background with ID: $1.'))
+        const hit = BG_LAUNCH.exec(
+          body
+            .replace(BG_MOVED, 'Command running in background with ID: $1.')
+            .replace(BG_TIMEOUT, 'Command running in background with ID: $1.'),
+        )
         const mcp = BG_MCP.exec(body)
         const tool = typeof block.tool_use_id === 'string' ? state.tools.get(block.tool_use_id) : undefined
         if (typeof block.tool_use_id === 'string') state.tools.delete(block.tool_use_id)
