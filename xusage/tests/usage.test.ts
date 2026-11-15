@@ -340,7 +340,8 @@ test('renders compact usage labels without retry errors', async () => {
     expect(tone(first, 'warning')).toBeUndefined()
     env.advance(120_000)
     const second = await render($, event, async () => undefined)
-    expect(text(second)).toContain('max20')
+    expect(text(second)).toContain('ultra')
+    expect(text(second)).not.toContain('max20')
     expect(text(second)).toContain('12%')
     expect(text(second)).toContain('42k/1M')
     expect(text(second).indexOf('42k/1M')).toBeGreaterThan(text(second).indexOf('12%'))
@@ -388,7 +389,8 @@ test('renders compact usage labels without retry errors', async () => {
     oauth.rateLimitTier = 'default_claude_max_5x'
     env.advance(300_001)
     const five = await render($, event, async () => undefined)
-    expect(text(five)).toContain('max5')
+    expect(text(five)).toContain('max5h')
+    expect(text(five)).not.toContain('max55h')
     oauth.rateLimitTier = 'default_claude_max_6_5x'
     env.advance(300_001)
     const sixPointFive = await render($, event, async () => undefined)
@@ -1741,7 +1743,7 @@ test('uses the current credential plan when cached usage is stale', async () => 
 
   try {
     const band = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
-    expect(text(band)).toContain('max20')
+    expect(text(band)).toContain('ultra')
     expect(env.calls()).toBe(0)
   } finally {
     globalThis.h = originalH
@@ -1800,7 +1802,7 @@ test('keeps plan, agents and activity when usage fails with nothing cached', asy
 
   try {
     const band = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
-    expect(text(band)).toContain('max20')
+    expect(text(band)).toContain('ultra')
     expect(text(band)).toContain('42k/258k')
     expect(text(band)).toContain('1 agent')
     expect(text(band)).toContain('activity:')

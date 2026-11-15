@@ -351,7 +351,13 @@ function planLabel(plan: unknown, tier: unknown): string {
   const base = typeof plan === 'string' ? plan : ''
   if (typeof tier !== 'string') return base
   const match = tier.match(/^default_claude_([^_]+)_(\d+(?:_\d+)?)x$/)
-  return match === null ? base : `${match[1]}${match[2].replace('_', '.')}`
+  if (match === null) return base
+  // The host still issues the old 20x tier id for the plan now sold as Ultra; the 5x tier is plain Max.
+  if (match[1] === 'max') {
+    if (match[2] === '20') return 'ultra'
+    if (match[2] === '5') return 'max'
+  }
+  return `${match[1]}${match[2].replace('_', '.')}`
 }
 
 async function claudeToken($: EngineInterface): Promise<{ token: string; plan: string } | undefined> {

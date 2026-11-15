@@ -18,7 +18,7 @@ Claude Code's built-in agent UI does not cover background work well:
 
 ### Plan and quota
 
-- **Live plan label** — from your OAuth credentials in Claude account mode, from the proxy's quota headers in proxy mode: `max20`, `max5`, `max6.5`, `team6.5`, etc. It is resolved independently of quota, so it stays correct when usage is served from cache or held in a `429` backoff.
+- **Live plan label** — from your OAuth credentials in Claude account mode, from the proxy's quota headers in proxy mode: `ultra`, `max`, `pro`, `max6.5`, `team6.5`, etc. The host's old 20x tier id is shown as Ultra, its 5x tier as Max, matching the current plan names. It is resolved independently of quota, so it stays correct when usage is served from cache or held in a `429` backoff.
 - **Quota windows** — `5h`, `7d` (plus the opus/sonnet weekly windows when present) with percent used, a reset countdown and, when the band is wide enough, the local reset time: `5h 8% ↻ 2h 58m (30/10 14:09)`.
 - **Color at a glance** — 70% warns, 90% errors.
 - **Silent failures** — quota errors never add retry text, icons or buttons. On a `429` the last known good windows stay visible until the retry time; other failures show an empty window set. Retries continue in the background.
