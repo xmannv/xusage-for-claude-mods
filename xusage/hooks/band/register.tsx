@@ -639,11 +639,12 @@ const progress = (w: WorkflowRun) =>
 
 // Workflow runs are invisible to $.agent.list (it keeps local_agent and teammates only), so read the engine's
 // per-session run state: a wf dir exists while running and its final JSON appears when the run ends.
-// A run killed with its process (crash, quit, restart) never gets that JSON, so a run whose journal and agent
-// transcripts have all been silent for STALE_MS counts as dead.
+// A run killed with its process (crash, quit, restart) never gets that JSON, so a day bounds how long a run
+// without one can stay listed.
 // shortcut: private on-disk layout; if it changes, workflows silently disappear from the pane.
-// shortcut: a single tool call silent for longer than STALE_MS hides its still-live run.
-const STALE_MS = 60 * 60_000
+// shortcut: a silent run stays listed for that day even if its engine died; a single tool call can be silent for
+// hours, so silence cannot tell a live run from a dead one.
+const WF_KEEP_MS = 24 * 60 * 60_000
 let workflows: { at: number; list: WorkflowRun[] } | undefined
 let sessionDirCache: { session: string; dir: string } | undefined
 
@@ -799,7 +800,7 @@ async function taskIdMap($: EngineInterface, dir: string, names: readonly string
   return map
 }
 
-// The run dirs holding a .jsonl written within STALE_MS; undefined when the scan itself failed, since an
+// The run dirs holding a .jsonl written within WF_KEEP_MS; undefined when the scan itself failed, since an
 // unreadable listing is not an empty one and must not blank the pane.
 async function recentRuns($: EngineInterface, dir: string, now: number): Promise<Set<string> | undefined> {
   const root = `${dir}/subagents/workflows`
@@ -812,7 +813,7 @@ async function recentRuns($: EngineInterface, dir: string, now: number): Promise
       if (run.kind !== 'dir') continue
       const files = await $.fs.list(`${root}/${run.name}`).catch(() => undefined)
       if (files === undefined) return undefined
-      if (files.some(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= STALE_MS)) {
+      if (files.some(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= WF_KEEP_MS)) {
         names.add(run.name)
       }
     }
@@ -820,7 +821,7 @@ async function recentRuns($: EngineInterface, dir: string, now: number): Promise
   }
   // One find instead of a stat per run dir: a session accumulates hundreds of finished runs.
   const recent = await $.process
-    .run(['/usr/bin/find', root, '-mindepth', '2', '-maxdepth', '2', '-name', '*.jsonl', '-mmin', `-${STALE_MS / 60_000}`])
+    .run(['/usr/bin/find', root, '-mindepth', '2', '-maxdepth', '2', '-name', '*.jsonl', '-mmin', `-${WF_KEEP_MS / 60_000}`])
     .catch(() => undefined)
   if (recent === undefined || recent.exitCode !== 0) return undefined
   return new Set(
@@ -852,12 +853,11 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     workflows = { at: now, list: prev }
     return prev
   }
-  // One transcript scan names every run and tells a saved workflow's script apart from a per-run inline one.
-  const tasks = names.size === 0 ? undefined : await taskIdMap($, dir, [...names]).catch(() => undefined)
+  // The host lists a run until its final JSON appears, so only the still-open ones are worth naming against the
+  // transcript; a session accumulates hundreds of finished run dirs.
+  const open: string[] = []
   for (const name of names) {
-    const root = `${dir}/subagents/workflows/${name}`
-    const journal = `${root}/journal.jsonl`
-    const journalAt = await mtime($, journal)
+    const journalAt = await mtime($, `${dir}/subagents/workflows/${name}/journal.jsonl`)
     if (journalAt === 0) {
       keep(name)
       continue
@@ -865,6 +865,13 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     // A resumed run keeps its id and appends to the old journal while the previous run's final JSON stays put,
     // so the run is over only once that JSON is at least as new as the journal.
     if ((await mtime($, `${dir}/workflows/${name}.json`)) >= journalAt) continue
+    open.push(name)
+  }
+  // One transcript scan names every open run and tells a saved workflow's script apart from a per-run inline one.
+  const tasks = open.length === 0 ? undefined : await taskIdMap($, dir, open).catch(() => undefined)
+  for (const name of open) {
+    const root = `${dir}/subagents/workflows/${name}`
+    const journal = `${root}/journal.jsonl`
     let at = 0
     // Fallback only: agent metas are rewritten when an agent finishes, so their mtimes are not spawn times.
     let earliest = now
@@ -879,7 +886,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       keep(name)
       continue
     }
-    if (now - at > STALE_MS) continue
+    if (now - at > WF_KEEP_MS) continue
     // Result lines carry the agent's whole output, so only their keys are read; started/failed lines are small and
     // read in journal order, since a failed attempt may be retried under the same key.
     const events = await grepFile($, journal, '"type":"(started|failed)"').catch(() => undefined)

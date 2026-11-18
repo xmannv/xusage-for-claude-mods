@@ -679,6 +679,45 @@ test('titles a saved workflow whose script has no run id', async () => {
   }
 })
 
+test('keeps a workflow visible while it has not reported its end', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-silent'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_silent')
+  mkdirSync(root, { recursive: true })
+  const past = new Date(Date.now() - 75 * 60_000)
+  const journal = join(root, 'journal.jsonl')
+  const agent = join(root, 'agent-a1.jsonl')
+  await Bun.write(
+    journal,
+    `${JSON.stringify({ type: 'started', key: 'S1', agentId: 'a1', label: 'long impl', phase: 'Setup' })}\n`,
+  )
+  await Bun.write(
+    agent,
+    `${JSON.stringify({
+      type: 'assistant',
+      timestamp: past.toISOString(),
+      message: { model: 'claude-opus-5', usage: { input_tokens: 10 } },
+    })}\n`,
+  )
+  utimesSync(journal, past, past)
+  utimesSync(agent, past, past)
+  mkdirSync(join(dir, 'workflows', 'scripts'), { recursive: true })
+  const script = join(dir, 'workflows', 'scripts', 'long-run-wf_silent.js')
+  await Bun.write(script, "export const meta = { name: 'long-run', description: 'Long silent run' };\n")
+  utimesSync(script, past, past)
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('Workflows (1)')
+    expect(rendered).toContain('Long silent run')
+    expect(rendered).toContain('long impl')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps last-known-good rows when a pane read fails', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
