@@ -817,6 +817,26 @@ test('drops a workflow whose engine process is gone', async () => {
   }
 })
 
+test('shows the conversation name in the band and the pane', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-named'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  mkdirSync(join(env.root, 'sessions'), { recursive: true })
+  await Bun.write(
+    join(env.root, 'sessions', '777.json'),
+    JSON.stringify({ sessionId: session, startedAt: Date.now(), name: 'co-tuong-ae' }),
+  )
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    expect(paneText(await harness.render())).toContain('co-tuong-ae')
+    expect(paneText(await harness.renderBand())).toContain('co-tuong-ae')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps last-known-good rows when a pane read fails', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
@@ -1335,9 +1355,11 @@ async function paneHarness(
 ) {
   const { register } = await loadModule()
   let pane: any
+  let band: any
   const registration = { catch: () => registration }
   register((event: string, filter: any, handler: any) => {
     if (filter.component === 'Pane') pane = handler
+    if (filter.component === 'AbovePrompt') band = handler
     return registration
   })
   const originalH = globalThis.h
@@ -1376,7 +1398,12 @@ async function paneHarness(
           mtimeMs: entry.isFile() ? statSync(join(path, entry.name)).mtimeMs : 0,
         })),
     },
-    session: { id: async () => options.session, root: async () => '/tmp/work', cwd: async () => '/tmp/work/sub' },
+    session: {
+      id: async () => options.session,
+      root: async () => '/tmp/work',
+      cwd: async () => '/tmp/work/sub',
+      usage: async () => ({ context: { tokens: 42_000, window: 258_000 } }),
+    },
     ui: {
       resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
       close: async () => undefined,
@@ -1386,6 +1413,7 @@ async function paneHarness(
   }
   return {
     render: () => pane($, { requestId: 'usage-band-agents' }, async () => undefined),
+    renderBand: () => band($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined),
     restore: () => {
       for (const handle of held) closeSync(handle)
       globalThis.h = originalH

@@ -715,27 +715,30 @@ async function sessionDir($: EngineInterface): Promise<string> {
   return dir
 }
 
-// The engine writes one small file per live process under sessions/; the one naming this session carries the
-// process start time. A run whose newest write predates that process was hosted by an earlier one that is gone,
-// so the final JSON it would end with can never arrive.
-async function engineStart($: EngineInterface): Promise<number> {
+// The engine writes one small file per live process under sessions/; the newest one naming this session carries
+// the process start and the conversation name the resume list shows. A run whose newest write predates that
+// process was hosted by an earlier one that is gone, so the final JSON it would end with can never arrive.
+async function engineSession($: EngineInterface): Promise<{ at: number; name: string }> {
   const session = await $.session.id()
   const dir = `${await claudeDir($)}/sessions`
   let at = 0
+  let name = ''
   // Not cached: this process may find only a crashed predecessor's file on its first render, and the newer start
-  // that arrives next render must win over it.
+  // that arrives next render must win over it; a rename also lands here.
   for (const entry of await $.fs.list(dir).catch(() => [])) {
     if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
     try {
       const data = JSON.parse(await $.fs.read(`${dir}/${entry.name}`))
       if (data?.sessionId !== session) continue
       const started = Number(data?.startedAt)
-      if (Number.isFinite(started)) at = Math.max(at, started)
+      if (!Number.isFinite(started) || started < at) continue
+      at = started
+      name = typeof data?.name === 'string' ? data.name : ''
     } catch {
       // A file caught mid-write is read again next time.
     }
   }
-  return at
+  return { at, name }
 }
 
 // Same title Claude shows: the workflow's own description, not the prompt of whichever agent runs first.
@@ -885,7 +888,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     workflows = { at: now, list: prev }
     return prev
   }
-  const booted = await engineStart($).catch(() => 0)
+  const engine = await engineSession($).catch(() => ({ at: 0, name: '' }))
   // The host lists a run until its final JSON appears, so only the still-open ones are worth naming against the
   // transcript; a session accumulates hundreds of finished run dirs.
   const open: string[] = []
@@ -922,7 +925,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       keep(name)
       continue
     }
-    if (booted > 0 && at < booted) continue
+    if (engine.at > 0 && at < engine.at) continue
     if (now - at > WF_KEEP_MS) continue
     // Result lines carry the agent's whole output, so only their keys are read; started/failed lines are small and
     // read in journal order, since a failed attempt may be retried under the same key.
@@ -1731,6 +1734,11 @@ export const register: Register = on => {
     const bgStale = bg.length - bgLive
     const act = await lastActivity($, wf).catch(() => undefined)
     const latest = Math.max(act?.at ?? 0, ...bg.map(t => t.at))
+    const conversation = (await engineSession($).catch(() => undefined))?.name ?? ''
+    const trailing = [
+      conversation,
+      latest > 0 ? `activity: ${activityText(now - latest)}` : '',
+    ].filter(Boolean).join(' · ')
     live = active > 0 || wf.length > 0 || bgLive > 0
     const badge = [
       wf.length > 0 ? `${wf.length} wf` : '',
@@ -1802,7 +1810,7 @@ export const register: Register = on => {
             </Button>
           )}
         </Box>
-        {latest > 0 && <Text dimColor>activity: {activityText(now - latest)}</Text>}
+        {trailing !== '' && <Text dimColor>{trailing}</Text>}
       </Box>
     )
   }).catch(($, e, next) => next(e))
@@ -1826,6 +1834,7 @@ export const register: Register = on => {
     const bg = await bgTasks($).catch(() => [])
     const now = await $.clock.now().catch(() => Date.now())
     const act = await lastActivity($, runs).catch(() => undefined)
+    const conversation = (await engineSession($).catch(() => undefined))?.name ?? ''
     const dir = await sessionDir($).catch(() => '')
     const modelText = new Map<string, string>()
     const effortText = new Map<string, string>()
@@ -1857,6 +1866,7 @@ export const register: Register = on => {
     return (
       // No width: bodyColumns is narrower than the webview pane, so lines would truncate mid-pane.
       <Box flexDirection="column" gap={1} paddingX={1}>
+        {conversation !== '' && <Text bold>{conversation}</Text>}
         {rows.length === 0 ? (
           <Text dimColor>
             {runs.length > 0
