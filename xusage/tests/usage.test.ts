@@ -557,21 +557,21 @@ test('titles a running workflow with its script meta and names it by task id', a
     }
     const wfBox = find(rendered, 'wf_abc')
     expect(text(wfBox.children[0])).toBe('S3 test-gap round 2 + review, then S4 -> S8')
-    expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · now')
+    expect(text(wfBox.children[1])).toBe('wft7bs6ek · 1 running · started: 5m · activity: now')
     const runningSpan = wfBox.children[1].children.find((child: any) => child?.props?.color === 'success')
     expect(text(runningSpan)).toBe('1 running')
     const wfAgent = find(rendered, 'wf_abc-0')
     expect(text(wfAgent.children[0])).toBe('- review-S8-r1 · claude-opus-5 · high · S8 · 50k tokens')
     expect(text(wfAgent.children[1])).toBe('  Poll build')
-    expect(text(wfAgent.children[2])).toBe('  started: 5m · 5m ago')
+    expect(text(wfAgent.children[2])).toBe('  started: 5m · activity: 5m ago')
     expect(text(rendered)).toContain('Agents (1)')
     const agentBox = find(rendered, 'b2')
     expect(text(agentBox.children[0])).toBe('Implement top-up bonus rate')
     expect(text(agentBox.children[1])).toBe('b2 · subagent · claude-opus-5-5 · xhigh · running · 130k tokens')
-    expect(text(agentBox.children[2])).toBe('started: 1h20m · now')
+    expect(text(agentBox.children[2])).toBe('started: 1h20m · activity: now')
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
-    expect(text(rendered)).toContain('started: 1h20m · now')
+    expect(text(rendered)).toContain('started: 1h20m · activity: now')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
@@ -1069,7 +1069,7 @@ test('names the last tool a live agent started', async () => {
     expect(text(agentBox.children[0])).toBe('Author Task 23 USER-RUN script')
     expect(text(agentBox.children[1])).toBe('a1 · subagent · claude-opus-5-5 · running · 130k tokens')
     expect(text(agentBox.children[2])).toBe('Reading a.ts')
-    expect(text(agentBox.children[3])).toBe('started: 30s · now')
+    expect(text(agentBox.children[3])).toBe('started: 30s · activity: now')
     // Only the newest tool, even though both already have results.
     expect(text(agentBox.children[2])).not.toContain('Replace $OUT/evidence uses with $EV')
   } finally {
@@ -1228,11 +1228,11 @@ test('shows background tasks and marks a dead silent one stale', async () => {
     expect(text(rendered)).toContain('Subagent bg')
     const live = find(rendered, 'bg-blive123')
     expect(text(live.children[0])).toBe('Run lanes per class')
-    expect(text(live.children[1])).toBe('blive123 · started: 30s · now · running')
+    expect(text(live.children[1])).toBe('blive123 · started: 30s · activity: now · running')
     const stale = find(rendered, 'bg-bstale12')
     expect(text(stale.children[1])).toBe('bstale12 · started: 30s · stale')
     const sub = find(rendered, 'bg-bsub123')
-    expect(text(sub.children[1])).toBe('bsub123 · started: 30s · now · running')
+    expect(text(sub.children[1])).toBe('bsub123 · started: 30s · activity: now · running')
     expect(text(rendered)).not.toContain('Already done')
     expect(text(rendered)).not.toContain('Stopped by model')
     expect(text(rendered)).not.toContain('Previous process')
@@ -1340,7 +1340,7 @@ test('marks a background task unverified when liveness cannot be probed', async 
   try {
     const rendered = await pane($, { requestId: 'usage-band-agents' }, async () => undefined)
     expect(text(rendered)).toContain('Background (1)')
-    expect(text(rendered)).toContain('bunkn123 · started: 30s · now · unverified')
+    expect(text(rendered)).toContain('bunkn123 · started: 30s · activity: now · unverified')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
@@ -1480,7 +1480,7 @@ test('finds background tasks under the resumed conversation id', async () => {
     const rendered = await harness.render()
     expect(paneText(rendered)).toContain('Background (1)')
     expect(paneText(rendered)).toContain('Resumed shell')
-    expect(paneText(rendered)).toContain('bresume1 · started: 30s · now · running')
+    expect(paneText(rendered)).toContain('bresume1 · started: 30s · activity: now · running')
   } finally {
     harness.restore()
   }
@@ -1512,7 +1512,7 @@ test('ignores a title stub at the runtime session id', async () => {
     const rendered = await harness.render()
     expect(paneText(rendered)).toContain('Background (1)')
     expect(paneText(rendered)).toContain('Behind the stub')
-    expect(paneText(rendered)).toContain('bstub123 · started: 30s · now · running')
+    expect(paneText(rendered)).toContain('bstub123 · started: 30s · activity: now · running')
   } finally {
     harness.restore()
   }
@@ -1542,7 +1542,7 @@ test('recovers a launch past the capped grep output from the transcript tail', a
     const rendered = await harness.render()
     expect(paneText(rendered)).toContain('Background (1)')
     expect(paneText(rendered)).toContain('Late launch')
-    expect(paneText(rendered)).toContain('bhuge123 · started: 30s · now · running')
+    expect(paneText(rendered)).toContain('bhuge123 · started: 30s · activity: now · running')
   } finally {
     harness.restore()
   }
@@ -1572,7 +1572,7 @@ test('finds a launch pushed past the tail by later output', async () => {
     }
     expect(paneText(rendered)).toContain('Background (1)')
     expect(paneText(rendered)).toContain('Deep launch')
-    expect(paneText(rendered)).toContain('bbeyond1 · started: 30s · now · running')
+    expect(paneText(rendered)).toContain('bbeyond1 · started: 30s · activity: now · running')
   } finally {
     harness.restore()
   }
@@ -1679,7 +1679,7 @@ test('finds a foreground command the host moved to the background after its time
     const rendered = await harness.render()
     expect(paneText(rendered)).toContain('Background (1)')
     expect(paneText(rendered)).toContain('Export report')
-    expect(paneText(rendered)).toContain('bauto123 · started: 18m · now · running')
+    expect(paneText(rendered)).toContain('bauto123 · started: 18m · activity: now · running')
   } finally {
     harness.restore()
   }
@@ -1731,7 +1731,7 @@ test('shows a command the host set aside to deliver a queued message', async () 
     const rendered = paneText(await harness.render())
     expect(rendered).toContain('Background (1)')
     expect(rendered).toContain('Measure per-process CPU during Windows flood')
-    expect(rendered).toContain('b0ggt4n6o · started: 4m · now · running')
+    expect(rendered).toContain('b0ggt4n6o · started: 4m · activity: now · running')
   } finally {
     harness.restore()
   }

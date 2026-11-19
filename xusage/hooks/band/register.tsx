@@ -1556,7 +1556,7 @@ const bgSpan = (task: BgTask, now: number) =>
   [
     task.id,
     task.startedAt > 0 ? `started: ${ago(now - task.startedAt)}` : '',
-    task.at > 0 ? activityText(now - task.at) : '',
+    task.at > 0 ? `activity: ${activityText(now - task.at)}` : '',
   ]
     .filter(Boolean)
     .join(' · ')
@@ -1855,7 +1855,7 @@ export const register: Register = on => {
     const timeline = (started: number | undefined, at: number | undefined) =>
       [
         started !== undefined && started > 0 ? `started: ${ago(now - started)}` : '',
-        at !== undefined && at > 0 ? activityText(now - at) : '',
+        at !== undefined && at > 0 ? `activity: ${activityText(now - at)}` : '',
       ]
         .filter(Boolean)
         .join(' · ')
