@@ -715,6 +715,29 @@ async function sessionDir($: EngineInterface): Promise<string> {
   return dir
 }
 
+// The engine writes one small file per live process under sessions/; the one naming this session carries the
+// process start time. A run whose newest write predates that process was hosted by an earlier one that is gone,
+// so the final JSON it would end with can never arrive.
+async function engineStart($: EngineInterface): Promise<number> {
+  const session = await $.session.id()
+  const dir = `${await claudeDir($)}/sessions`
+  let at = 0
+  // Not cached: this process may find only a crashed predecessor's file on its first render, and the newer start
+  // that arrives next render must win over it.
+  for (const entry of await $.fs.list(dir).catch(() => [])) {
+    if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
+    try {
+      const data = JSON.parse(await $.fs.read(`${dir}/${entry.name}`))
+      if (data?.sessionId !== session) continue
+      const started = Number(data?.startedAt)
+      if (Number.isFinite(started)) at = Math.max(at, started)
+    } catch {
+      // A file caught mid-write is read again next time.
+    }
+  }
+  return at
+}
+
 // Same title Claude shows: the workflow's own description, not the prompt of whichever agent runs first.
 // Only the script exists while a run is active; the run's final JSON is written when it ends.
 // shortcut: the script is scanned as text, not evaluated.
@@ -862,6 +885,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     workflows = { at: now, list: prev }
     return prev
   }
+  const booted = await engineStart($).catch(() => 0)
   // The host lists a run until its final JSON appears, so only the still-open ones are worth naming against the
   // transcript; a session accumulates hundreds of finished run dirs.
   const open: string[] = []
@@ -898,6 +922,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       keep(name)
       continue
     }
+    if (booted > 0 && at < booted) continue
     if (now - at > WF_KEEP_MS) continue
     // Result lines carry the agent's whole output, so only their keys are read; started/failed lines are small and
     // read in journal order, since a failed attempt may be retried under the same key.

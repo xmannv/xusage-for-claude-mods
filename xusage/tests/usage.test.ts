@@ -781,6 +781,42 @@ test('drops a workflow the host announced as stopped', async () => {
   }
 })
 
+test('drops a workflow whose engine process is gone', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-engine-gone'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_orphan')
+  mkdirSync(root, { recursive: true })
+  const past = new Date(Date.now() - 2 * 60 * 60_000)
+  const journal = join(root, 'journal.jsonl')
+  const agent = join(root, 'agent-a1.jsonl')
+  await Bun.write(
+    journal,
+    `${JSON.stringify({ type: 'started', key: 'S1', agentId: 'a1', label: 'orphan impl', phase: 'Setup' })}\n`,
+  )
+  await Bun.write(
+    agent,
+    `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n`,
+  )
+  utimesSync(journal, past, past)
+  utimesSync(agent, past, past)
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  // This engine started an hour ago; the run last wrote an hour before that and never wrote its final JSON.
+  mkdirSync(join(env.root, 'sessions'), { recursive: true })
+  await Bun.write(
+    join(env.root, 'sessions', '4242.json'),
+    JSON.stringify({ sessionId: session, startedAt: Date.now() - 60 * 60_000 }),
+  )
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).not.toContain('Workflows (1)')
+    expect(rendered).not.toContain('orphan impl')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps last-known-good rows when a pane read fails', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))
