@@ -718,6 +718,69 @@ test('keeps a workflow visible while it has not reported its end', async () => {
   }
 })
 
+test('drops a workflow the host announced as stopped', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-stopped'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const run = async (name: string, label: string) => {
+    const root = join(dir, 'subagents', 'workflows', name)
+    mkdirSync(root, { recursive: true })
+    await Bun.write(
+      join(root, 'journal.jsonl'),
+      `${JSON.stringify({ type: 'started', key: `${name}-k`, agentId: 'a1', label, phase: 'Setup' })}\n`,
+    )
+    await Bun.write(
+      join(root, 'agent-a1.jsonl'),
+      `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n`,
+    )
+  }
+  await run('wf_dead', 'dead impl')
+  await run('wf_live', 'live impl')
+  await Bun.write(
+    `${dir}.jsonl`,
+    [
+      JSON.stringify({
+        type: 'user',
+        toolUseResult: {
+          status: 'async_launched',
+          taskId: 'wdead01',
+          taskType: 'local_workflow',
+          workflowName: 'gone-wf',
+          runId: 'wf_dead',
+          summary: 'gone',
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        toolUseResult: {
+          status: 'async_launched',
+          taskId: 'wlive01',
+          taskType: 'local_workflow',
+          workflowName: 'live-wf',
+          runId: 'wf_live',
+          summary: 'live',
+        },
+      }),
+      JSON.stringify({
+        type: 'queue-operation',
+        content:
+          '<task-notification>\n<task-id>wdead01</task-id>\n<status>stopped</status>\n' +
+          '<summary>Background workflow "gone-wf" stopped</summary>\n</task-notification>',
+      }),
+    ].join('\n') + '\n',
+  )
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('Workflows (1)')
+    expect(rendered).toContain('live-wf')
+    expect(rendered).not.toContain('gone-wf')
+    expect(rendered).not.toContain('dead impl')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('keeps last-known-good rows when a pane read fails', async () => {
   const { register } = await loadModule()
   const env = engine(async () => ok(12))

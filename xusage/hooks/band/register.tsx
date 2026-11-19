@@ -188,7 +188,7 @@ async function headLine($: EngineInterface, path: string): Promise<string | unde
  */
 async function grepFile($: EngineInterface, path: string, pattern: string, only = false): Promise<string | undefined> {
   if (!(await onWindows($))) {
-    const out = await $.process.run(['/usr/bin/grep', only ? '-o' : '-E', pattern, path]).catch(() => undefined)
+    const out = await $.process.run(['/usr/bin/grep', only ? '-Eo' : '-E', pattern, path]).catch(() => undefined)
     return out === undefined || out.exitCode > 1 ? undefined : out.stdout
   }
   const cut = (text: string) => {
@@ -774,30 +774,39 @@ async function agentStart($: EngineInterface, path: string): Promise<number> {
 
 // The conversation names a run by the task id its launch result carries; the run id only names the directory. That
 // result is the one place the pair sits together, so a run launched before the pane looked needs a transcript scan.
+// The same scan collects the host's task notifications: a run the host ends without a final JSON (session quit,
+// kill) is named there, and that notification is the only trace it leaves.
 // A miss is retried only after a pause: the result is written just after the run dir and may not be there yet.
 const TASK_SCAN_MS = 30_000
+const ENDED_SCAN_MS = 60_000
 type RunNames = { task: string; workflow: string }
-let taskIds: { at: number; map: Map<string, RunNames> } | undefined
+type TaskScan = { at: number; map: Map<string, RunNames>; ended: Set<string> }
+let taskIds: TaskScan | undefined
+const TASK_PAIR = '"taskId":"[^"]*","taskType":"local_workflow"[^}]*"runId":"[^"]*"'
+const TASK_ENDED = '<task-id>[^<]*</task-id>'
 
-async function taskIdMap($: EngineInterface, dir: string, names: readonly string[]): Promise<Map<string, RunNames>> {
-  if (taskIds !== undefined && names.every(name => taskIds?.map.has(name))) return taskIds.map
+async function taskIdMap($: EngineInterface, dir: string, names: readonly string[]): Promise<TaskScan> {
   const now = await $.clock.now()
-  if (taskIds !== undefined && now - taskIds.at < TASK_SCAN_MS) return taskIds.map
+  if (taskIds !== undefined) {
+    const known = names.every(name => taskIds!.map.has(name))
+    // A complete map still asks again for ended tasks, at a slower pace.
+    if (now - taskIds.at < (known ? ENDED_SCAN_MS : TASK_SCAN_MS)) return taskIds
+  }
   const map = taskIds?.map ?? new Map<string, RunNames>()
-  const found = await grepFile(
-    $,
-    `${dir}.jsonl`,
-    '"taskId":"[^"]*","taskType":"local_workflow"[^}]*"runId":"[^"]*"',
-    true,
-  ).catch(() => undefined)
+  const ended = taskIds?.ended ?? new Set<string>()
+  const found = await grepFile($, `${dir}.jsonl`, `${TASK_PAIR}|${TASK_ENDED}`, true).catch(() => undefined)
   for (const line of (found ?? '').split('\n')) {
+    if (line.startsWith('<task-id>')) {
+      ended.add(line.slice('<task-id>'.length, -'</task-id>'.length))
+      continue
+    }
     const pair = /^"taskId":"([^"]+)".*"runId":"([^"]+)"$/.exec(line)
     if (pair === null) continue
     const workflow = /"workflowName":"([^"]*)"/.exec(line)?.[1] ?? ''
     map.set(pair[2], { task: pair[1], workflow })
   }
-  taskIds = { at: now, map }
-  return map
+  taskIds = { at: now, map, ended }
+  return taskIds
 }
 
 // The run dirs holding a .jsonl written within WF_KEEP_MS; undefined when the scan itself failed, since an
@@ -870,6 +879,9 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
   // One transcript scan names every open run and tells a saved workflow's script apart from a per-run inline one.
   const tasks = open.length === 0 ? undefined : await taskIdMap($, dir, open).catch(() => undefined)
   for (const name of open) {
+    // A run the host announced as ended has no final JSON to show it; the notification is its only marker.
+    const launch = tasks?.map.get(name)
+    if (launch !== undefined && tasks!.ended.has(launch.task)) continue
     const root = `${dir}/subagents/workflows/${name}`
     const journal = `${root}/journal.jsonl`
     let at = 0
@@ -936,7 +948,6 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
         tool: path === undefined ? undefined : await agentTool($, path),
       })
     }
-    const launch = tasks?.get(name)
     const info = await workflowInfo($, dir, name, launch?.workflow ?? '')
     list.push({
       id: name,
