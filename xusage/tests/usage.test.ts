@@ -1578,6 +1578,53 @@ test('finds a launch pushed past the tail by later output', async () => {
   }
 })
 
+test('finds a subagent launch written while the pane was closed', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-reopen'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(join(dir, 'subagents'), { recursive: true })
+  const tasks = join(env.root, 'bg-reopen')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const start = boot + 30_000
+  let now = start
+  const first = join(tasks, 'breopen1.output')
+  const second = join(tasks, 'breopen2.output')
+  await Bun.write(first, 'out')
+  await Bun.write(second, 'out')
+  utimesSync(second, new Date(start), new Date(start))
+  const agentPath = join(dir, 'subagents', 'agent-reopen1.jsonl')
+  await Bun.write(agentPath, `${bgLaunch('tu1', 'breopen1', first, 'First shell', start)}\n`)
+  // Away from the recent window: the launch below lands while the pane is closed, so only a second backfill sees it.
+  const old = new Date(boot - 5 * 60_000)
+  utimesSync(agentPath, old, old)
+  const harness = await paneHarness(env, { session, now: () => now, alive: [first, second] })
+  try {
+    const seen = async (marker: string) => {
+      let rendered = await harness.render()
+      const deadline = Date.now() + 2_000
+      while (!paneText(rendered).includes(marker) && Date.now() < deadline) {
+        await Bun.sleep(25)
+        rendered = await harness.render()
+      }
+      return paneText(rendered)
+    }
+    expect(await seen('First shell')).toContain('First shell')
+    await Bun.write(
+      agentPath,
+      `${await Bun.file(agentPath).text()}${bgLaunch('tu2', 'breopen2', second, 'Late shell', start + 90_000)}\n`,
+    )
+    utimesSync(agentPath, old, old)
+    now = start + 5 * 60_000
+    const rendered = await seen('Late shell')
+    expect(rendered).toContain('Background (2)')
+    expect(rendered).toContain('Late shell')
+    expect(rendered).toContain('breopen2 ·')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('shows an MCP call the host moved to a background task', async () => {
   const env = engine(async () => ok(12))
   const session = 'sess-bg-mcp'

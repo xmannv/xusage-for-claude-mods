@@ -1153,7 +1153,8 @@ type BgState = {
   tools: Map<string, { label: string; command: string; at: number }>
   main: BgFile
   files: Map<string, BgFile>
-  backfilled: boolean
+  backfilledAt: number
+  scanning: boolean
 }
 
 // Background tasks have no plugin API; the launch result in a transcript is the only record. A task is open until
@@ -1164,6 +1165,9 @@ const BG_SCAN_MS = 30_000
 const BG_RECENT_MS = 120_000
 const BG_GRACE_MS = 10_000
 const BG_KEEP_MS = 24 * 60 * 60_000
+// A launch is read only while its transcript is recent, and the pane renders no scans while it is closed. A pass
+// this often re-reads what landed since the last one, so a launch written in between still shows after a reopen.
+const BG_RESCAN_MS = 120_000
 // A launch from a previous supervisor cannot still be running after a restart; without a terminal record it
 // would only resurface as a stale row the user cannot act on.
 const BOOT_MS = Date.now()
@@ -1199,7 +1203,8 @@ const bgNewState = (session: string): BgState => ({
   tools: new Map(),
   main: bgNewFile(),
   files: new Map(),
-  backfilled: false,
+  backfilledAt: 0,
+  scanning: false,
 })
 
 function bgClose(state: BgState, id: string) {
@@ -1391,10 +1396,16 @@ async function bgPrefilter($: EngineInterface, files: readonly string[]): Promis
   return hits
 }
 
-// One pass over the transcripts that predate this process. New launches are picked up by the recent window below,
-// so this runs off the render path and only once per session.
-async function bgBackfill($: EngineInterface, state: BgState, dir: string, now: number): Promise<void> {
-  const files = await bgSubagentFiles($, dir, now, BG_KEEP_MS)
+// A pass over the transcripts the recent window does not reach. It runs off the render path and only seeds files
+// it has not seen yet, so a repeated pass is cheap.
+async function bgBackfill(
+  $: EngineInterface,
+  state: BgState,
+  dir: string,
+  now: number,
+  windowMs: number,
+): Promise<void> {
+  const files = await bgSubagentFiles($, dir, now, windowMs)
   const hits = await bgPrefilter($, files)
   for (const path of files) {
     if (!hits.has(path)) continue
@@ -1537,12 +1548,18 @@ async function bgTasks($: EngineInterface): Promise<BgTask[]> {
     }
     await bgRefreshFile($, path, file, bgState)
   }
-  if (!bgState.backfilled) {
-    bgState.backfilled = true
+  if (!bgState.scanning && (bgState.backfilledAt === 0 || now - bgState.backfilledAt >= BG_RESCAN_MS)) {
+    // Everything since the last pass, plus one cadence of slack for writes racing its find.
+    const windowMs = bgState.backfilledAt === 0
+      ? BG_KEEP_MS
+      : Math.min(BG_KEEP_MS, now - bgState.backfilledAt + BG_RESCAN_MS)
     const state = bgState
-    void bgBackfill($, state, dir, now)
+    bgState.backfilledAt = now
+    bgState.scanning = true
+    void bgBackfill($, state, dir, now, windowMs)
       .catch(() => undefined)
       .finally(() => {
+        state.scanning = false
         if (bgState === state) bgCache = undefined
       })
   }
