@@ -645,6 +645,10 @@ const progress = (w: WorkflowRun) =>
 // shortcut: a silent run stays listed for that day even if its engine died; a single tool call can be silent for
 // hours, so silence cannot tell a live run from a dead one.
 const WF_KEEP_MS = 24 * 60 * 60_000
+// The run row waits a day, but a key whose latest attempt has written nothing for this long is not running: the
+// host retries it as a fresh line in the journal, and a script edited since the launch leaves its old keys behind
+// for good. The host's own count lists only the attempts it is running now.
+const WF_QUIET_MS = 30 * 60_000
 let workflows: { at: number; list: WorkflowRun[] } | undefined
 let sessionDirCache: { session: string; dir: string } | undefined
 
@@ -965,6 +969,8 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
     const agents: WorkflowRun['agents'] = []
     for (const { agentId, ...a } of pending.values()) {
       const path = agentId === '' ? undefined : `${root}/agent-${agentId}.jsonl`
+      const at = path === undefined ? 0 : await mtime($, path)
+      if (at > 0 && now - at > WF_QUIET_MS) continue
       const usage = path === undefined ? undefined : await agentUsage($, path)
       agents.push({
         ...a,
@@ -972,7 +978,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
         effort: usage?.effort ?? '',
         tokens: usage?.tokens,
         startedAt: path === undefined ? 0 : await agentStart($, path),
-        at: path === undefined ? 0 : await mtime($, path),
+        at,
         tool: path === undefined ? undefined : await agentTool($, path),
       })
     }

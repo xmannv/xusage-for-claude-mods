@@ -712,7 +712,47 @@ test('keeps a workflow visible while it has not reported its end', async () => {
     const rendered = paneText(await harness.render())
     expect(rendered).toContain('Workflows (1)')
     expect(rendered).toContain('Long silent run')
-    expect(rendered).toContain('long impl')
+    expect(rendered).toContain('0 running')
+    expect(rendered).not.toContain('long impl')
+  } finally {
+    harness.restore()
+  }
+})
+
+test('counts only the attempts still writing as running', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-quiet'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_mix')
+  mkdirSync(root, { recursive: true })
+  const attempt = async (agent: string, age: number) => {
+    const path = join(root, `agent-${agent}.jsonl`)
+    await Bun.write(
+      path,
+      `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n`,
+    )
+    const past = new Date(Date.now() - age)
+    utimesSync(path, past, past)
+  }
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    [
+      JSON.stringify({ type: 'started', key: 'K-live', agentId: 'l1', label: 'live build', phase: 'Build' }),
+      JSON.stringify({ type: 'started', key: 'K-quiet', agentId: 'q1', label: 'quiet build', phase: 'Build' }),
+      JSON.stringify({ type: 'started', key: 'K-done', agentId: 'd1', label: 'done build', phase: 'Build' }),
+      JSON.stringify({ type: 'result', key: 'K-done', agentId: 'd1', result: { score: 9 } }),
+    ].join('\n') + '\n',
+  )
+  await attempt('l1', 60_000)
+  // Edited since its launch, so this key's old attempt never reports again while its lane moved on.
+  await attempt('q1', 3 * 60 * 60_000)
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('1 running · 1 done')
+    expect(rendered).toContain('live build')
+    expect(rendered).not.toContain('quiet build')
   } finally {
     harness.restore()
   }
