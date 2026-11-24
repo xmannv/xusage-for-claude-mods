@@ -572,6 +572,17 @@ test('titles a running workflow with its script meta and names it by task id', a
     expect(text(rendered)).toContain('130k tokens')
     expect(text(rendered)).toContain('50k tokens')
     expect(text(rendered)).toContain('started: 1h20m · activity: now')
+    // A narrow pane splits the agent meta from its state and moves model, effort and tokens to their own line.
+    const narrow = await pane($, {
+      requestId: 'usage-band-agents',
+      surface: 'terminal',
+      props: { bodyColumns: 60 },
+    }, async () => undefined)
+    const narrowAgent = find(narrow, 'b2')
+    expect(narrowAgent.children[1].type).toBe('Box')
+    expect(narrowAgent.children[1].children.length).toBe(2)
+    expect(text(narrowAgent.children[1].children[0])).toBe('b2 · subagent · running')
+    expect(text(narrowAgent.children[1].children[1])).toBe('claude-opus-5-5 · xhigh · 130k tokens')
   } finally {
     globalThis.h = originalH
     globalThis.setInterval = originalSetInterval
@@ -872,6 +883,131 @@ test('shows the conversation name in the band and the pane', async () => {
   try {
     expect(paneText(await harness.render())).toContain('co-tuong-ae')
     expect(paneText(await harness.renderBand())).toContain('co-tuong-ae')
+  } finally {
+    harness.restore()
+  }
+})
+
+test('stacks the band on a narrow terminal and drops the conversation name in the middle', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-band-tiers'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_band')
+  mkdirSync(root, { recursive: true })
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    `${JSON.stringify({ type: 'started', key: 'S1', agentId: 'a1', label: 'impl', phase: 'S1' })}\n`,
+  )
+  await Bun.write(
+    join(root, 'agent-a1.jsonl'),
+    `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n`,
+  )
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  mkdirSync(join(env.root, 'sessions'), { recursive: true })
+  await Bun.write(
+    join(env.root, 'sessions', '888.json'),
+    JSON.stringify({ sessionId: session, startedAt: Date.now() - 60_000, name: 'band-tiers' }),
+  )
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const wide = await harness.renderBand(120)
+    expect(wide.props.flexDirection).toBe('row')
+    expect(paneText(wide)).toContain('band-tiers')
+    const mid = await harness.renderBand(84)
+    expect(mid.props.flexDirection).toBe('row')
+    expect(paneText(mid)).not.toContain('band-tiers')
+    const narrow = await harness.renderBand(60)
+    // Two rows: the plan and its windows above, the counts and the conversation below.
+    expect(narrow.props.flexDirection).toBe('column')
+    expect(narrow.children.length).toBe(2)
+    expect(paneText(narrow)).toContain('1 wf')
+    expect(paneText(narrow)).toContain('band-tiers')
+  } finally {
+    harness.restore()
+  }
+})
+
+test('keeps a reset to a clock time or a date, never both', async () => {
+  for (const hours of [2, 72] as const) {
+    const env = engine(async () => ({
+      status: 200,
+      ok: true,
+      headers: {},
+      text: JSON.stringify({
+        five_hour: { utilization: 12, resets_at: new Date(Date.now() + hours * 60 * 60_000).toISOString() },
+      }),
+    }))
+    const harness = await paneHarness(env, { session: `sess-reset-${hours}`, now: () => Date.now(), alive: [] })
+    try {
+      const drawn = paneText(await harness.renderBand(120))
+      expect(drawn).not.toMatch(/\(\d{2}\/\d{2} \d{2}:\d{2}\)/)
+      expect(drawn).toMatch(hours < 24 ? /\(\d{2}:\d{2}\)/ : /\(\d{2}\/\d{2}\)/)
+    } finally {
+      harness.restore()
+    }
+  }
+})
+
+test('stacks a workflow entry on a narrow terminal instead of truncating it', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-pane-narrow'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_narrow')
+  mkdirSync(root, { recursive: true })
+  const past = new Date(Date.now() - 5 * 60_000)
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    `${JSON.stringify({ type: 'started', key: 'S1', agentId: 'a1', label: 'impl', phase: 'S1' })}\n`,
+  )
+  const agent = join(root, 'agent-a1.jsonl')
+  await Bun.write(
+    agent,
+    `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 2 } } })}\n`,
+  )
+  utimesSync(agent, past, past)
+  mkdirSync(join(dir, 'workflows', 'scripts'), { recursive: true })
+  const script = join(dir, 'workflows', 'scripts', 'narrow-run-wf_narrow.js')
+  await Bun.write(script, "export const meta = { name: 'narrow-run', description: 'Narrow run' };\n")
+  utimesSync(script, past, past)
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  const find = (node: any, key: string): any => {
+    if (node == null || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = find(child, key)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (node.props?.key === key) return node
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      const hit = find(child, key)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  try {
+    const wide = await harness.render(120)
+    const wideRun = find(wide, 'wf_narrow')
+    expect(wideRun.children[1].type).toBe('Text')
+    expect(paneText(wideRun.children[1])).toContain('· started:')
+    expect(paneText(wideRun.children[1])).toContain('· activity:')
+    const wideAgent = find(wide, 'wf_narrow-0')
+    expect(wideAgent.children[0].type).toBe('Text')
+    expect(paneText(wideAgent.children[0])).toContain('· claude-opus-5')
+    const narrow = await harness.render(60)
+    const narrowRun = find(narrow, 'wf_narrow')
+    // The counts keep their row; started and activity take one of their own.
+    expect(narrowRun.children[1].type).toBe('Box')
+    expect(narrowRun.children[1].children.length).toBe(2)
+    expect(paneText(narrowRun.children[1].children[0])).not.toContain('started:')
+    expect(paneText(narrowRun.children[1].children[1])).toContain('started:')
+    const narrowAgent = find(narrow, 'wf_narrow-0')
+    expect(narrowAgent.children[0].type).toBe('Box')
+    expect(narrowAgent.children[0].children.length).toBe(2)
+    expect(paneText(narrowAgent.children[0].children[0])).toBe('- impl')
+    expect(paneText(narrowAgent.children[0].children[1])).toContain('claude-opus-5')
   } finally {
     harness.restore()
   }
@@ -1391,7 +1527,14 @@ test('marks a background task unverified when liveness cannot be probed', async 
 // stdout is capped like the host caps it, and the test controls the clock.
 async function paneHarness(
   env: ReturnType<typeof engine>,
-  options: { session: string; now: () => number; alive: string[]; cap?: number },
+  options: {
+    session: string
+    now: () => number
+    alive: string[]
+    cap?: number
+    columns?: number
+    surface?: 'terminal' | 'desktop'
+  },
 ) {
   const { register } = await loadModule()
   let pane: any
@@ -1452,8 +1595,17 @@ async function paneHarness(
     },
   }
   return {
-    render: () => pane($, { requestId: 'usage-band-agents' }, async () => undefined),
-    renderBand: () => band($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined),
+    render: (columns?: number) =>
+      pane($, {
+        requestId: 'usage-band-agents',
+        surface: options.surface ?? 'terminal',
+        props: { bodyColumns: columns ?? options.columns ?? 120 },
+      }, async () => undefined),
+    renderBand: (columns?: number) =>
+      band($, {
+        surface: options.surface ?? 'terminal',
+        props: { hasSurvey: false, bodyColumns: columns ?? options.columns ?? 120 },
+      }, async () => undefined),
     restore: () => {
       for (const handle of held) closeSync(handle)
       globalThis.h = originalH

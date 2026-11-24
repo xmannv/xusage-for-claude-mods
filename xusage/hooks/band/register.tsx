@@ -1623,10 +1623,13 @@ function resetIn(resetsAt: number, now: number): string {
   return `${mins}m`
 }
 
-function resetAt(resetsAt: number): string {
+function resetAt(resetsAt: number, now: number): string {
   const d = new Date(resetsAt)
   const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  // The relative count beside it already says how far; within a day the clock alone names the moment, past that the date.
+  return resetsAt - now < 24 * 60 * 60_000
+    ? `${pad(d.getHours())}:${pad(d.getMinutes())}`
+    : `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`
 }
 
 function tokenCount(value: number): string {
@@ -1738,7 +1741,11 @@ export const register: Register = on => {
     } catch {
       u = { ...EMPTY, source: 'claude', error: 'usage unavailable' }
     }
-    const showWhen = e.props.bodyColumns >= 100
+    // bodyColumns counts terminal cells; a graphical surface draws its buttons wider than their cells, so only a
+    // terminal is measured in cells.
+    const width = e.surface === 'terminal' ? e.props.bodyColumns : undefined
+    const showWhen = width === undefined || width >= 100
+    const narrow = width !== undefined && width < 72
     const context = await $.session.usage().then(result => result.context).catch(() => undefined)
     const contextLabel = typeof context?.tokens === 'number' && typeof context.window === 'number'
       ? `${tokenCount(context.tokens)}/${tokenCount(context.window)}`
@@ -1758,10 +1765,10 @@ export const register: Register = on => {
     const act = await lastActivity($, wf).catch(() => undefined)
     const latest = Math.max(act?.at ?? 0, ...bg.map(t => t.at))
     const conversation = (await engineSession($).catch(() => undefined))?.name ?? ''
-    const trailing = [
-      conversation,
-      latest > 0 ? activityText(now - latest) : '',
-    ].filter(Boolean).join(' · ')
+    const activity = latest > 0 ? activityText(now - latest) : ''
+    const trailing = [conversation, activity].filter(Boolean).join(' · ')
+    // The middle tier keeps a single row, so its right side sheds the conversation name first.
+    const trailText = width !== undefined && width >= 72 && width < 100 ? activity : trailing
     live = active > 0 || wf.length > 0 || bgLive > 0
     const badge = [
       wf.length > 0 ? `${wf.length} wf` : '',
@@ -1801,40 +1808,59 @@ export const register: Register = on => {
       ? `proxy${u.plan ? ` ${u.plan}` : ''}`
       : (await currentPlan($, u.plan).catch(() => u.plan)) || 'claude'
 
-    return stack(
-      // No width: the band stretches the row, and bodyColumns does not match the webview's width.
-      <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-        <Box flexDirection="row" gap={2} alignItems="center">
-          <Text bold>{shownPlan}</Text>
-          {u.windows.map(w => (
-            <Text key={w.key}>
-              <Text dimColor>{w.label} </Text>
-              <Text bold color={tone(w.used)}>{Math.round(w.used)}%</Text>
-              {w.resetsAt !== null && (
-                <Text dimColor>
-                  {' '}↻ {resetIn(w.resetsAt, now)}
-                  {showWhen ? ` (${resetAt(w.resetsAt)})` : ''}
-                </Text>
-              )}
+    const head = [
+      <Text key="plan" bold>{shownPlan}</Text>,
+      ...u.windows.map(w => (
+        <Text key={w.key}>
+          <Text dimColor>{w.label} </Text>
+          <Text bold color={tone(w.used)}>{Math.round(w.used)}%</Text>
+          {w.resetsAt !== null && (
+            <Text dimColor>
+              {' '}↻ {resetIn(w.resetsAt, now)}
+              {showWhen ? ` (${resetAt(w.resetsAt, now)})` : ''}
             </Text>
-          ))}
-          {contextText !== '' && (
-            <Text dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>
           )}
-          {(badge !== '' || bgStale > 0) && (
-            <Button key="agents" plain onPress={openAgents}>
-              {/* Clickable counts stay on suggestion; a stale count is a warning, so it gets its own tone. */}
-              <Text bold color="suggestion">
-                {badge}
-                {bgStale > 0 && (
-                  <Text color="warning">{`${badge === '' ? '' : ' · '}${bgStale} stale`}</Text>
-                )}
-              </Text>
-            </Button>
+        </Text>
+      )),
+      ...(contextText === ''
+        ? []
+        : [<Text key="context" dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>]),
+    ]
+    const badgeButton = badge !== '' || bgStale > 0
+      ? (
+        <Button key="agents" plain onPress={openAgents}>
+          {/* Clickable counts stay on suggestion; a stale count is a warning, so it gets its own tone. */}
+          <Text bold color="suggestion">
+            {badge}
+            {bgStale > 0 && (
+              <Text color="warning">{`${badge === '' ? '' : ' · '}${bgStale} stale`}</Text>
+            )}
+          </Text>
+        </Button>
+      )
+      : null
+
+    return stack(
+      // No width: the band stretches the row; the tiers pick the layout, they do not size it.
+      narrow ? (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={2} alignItems="center">{head}</Box>
+          {(badgeButton !== null || trailing !== '') && (
+            <Box flexDirection="row" justifyContent={badgeButton !== null ? 'space-between' : 'flex-end'} alignItems="center">
+              {badgeButton}
+              {trailing !== '' && <Text dimColor>{trailing}</Text>}
+            </Box>
           )}
         </Box>
-        {trailing !== '' && <Text dimColor>{trailing}</Text>}
-      </Box>
+      ) : (
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Box flexDirection="row" gap={2} alignItems="center">
+            {head}
+            {badgeButton}
+          </Box>
+          {trailText !== '' && <Text dimColor>{trailText}</Text>}
+        </Box>
+      ),
     )
   }).catch(($, e, next) => next(e))
 
@@ -1858,6 +1884,9 @@ export const register: Register = on => {
     const now = await $.clock.now().catch(() => Date.now())
     const act = await lastActivity($, runs).catch(() => undefined)
     const conversation = (await engineSession($).catch(() => undefined))?.name ?? ''
+    // bodyColumns counts terminal cells; a graphical surface draws wider than its cells, so only a terminal is measured.
+    const width = e.surface === 'terminal' ? e.props.bodyColumns : undefined
+    const narrow = width !== undefined && width < 72
     const dir = await sessionDir($).catch(() => '')
     const modelText = new Map<string, string>()
     const effortText = new Map<string, string>()
@@ -1867,9 +1896,9 @@ export const register: Register = on => {
     for (const a of rows) {
       const path = `${dir}/subagents/agent-${a.id}.jsonl`
       const { model, tokens, effort } = await agentUsage($, path)
-      if (model !== '') modelText.set(a.id, ` · ${model}`)
-      if (effort !== '') effortText.set(a.id, ` · ${effort}`)
-      if (tokens !== undefined) tokenText.set(a.id, ` · ${tokenCount(tokens)} tokens`)
+      if (model !== '') modelText.set(a.id, model)
+      if (effort !== '') effortText.set(a.id, effort)
+      if (tokens !== undefined) tokenText.set(a.id, `${tokenCount(tokens)} tokens`)
       const started = await agentStart($, path)
       if (started > 0) startedAt.set(a.id, started)
       const tool = await agentTool($, path)
@@ -1887,7 +1916,7 @@ export const register: Register = on => {
       $.ui.close({ id: AGENTS_PANE }).catch(() => undefined)
     }
     return (
-      // No width: bodyColumns is narrower than the webview pane, so lines would truncate mid-pane.
+      // No width: the host sizes the pane; the width above only picks the layout.
       <Box flexDirection="column" gap={1} paddingX={1}>
         {conversation !== '' && <Text bold>{conversation}</Text>}
         {rows.length === 0 ? (
@@ -1906,31 +1935,47 @@ export const register: Register = on => {
             {rows.map(a => {
               const span = timeline(startedAt.get(a.id), act?.agents[a.id])
               const state = statusTone(a.status)
+              const rest = [modelText.get(a.id), effortText.get(a.id), tokenText.get(a.id)].filter(Boolean).join(' · ')
               return (
                 <Box key={a.id} flexDirection="column">
                   {/* Same shape as a workflow: the name on top, id and the rest on the line below. */}
-                  <Text bold wrap="truncate-end">
+                  <Text bold wrap={narrow ? 'wrap' : 'truncate-end'}>
                     {agentName(a)}
                   </Text>
-                  <Text wrap="truncate-end">
-                    <Text dimColor>
-                      {a.id.slice(0, 8)}
+                  {narrow ? (
+                    <Box flexDirection="column">
+                      <Text wrap="wrap">
+                        <Text dimColor>
+                          {a.id.slice(0, 8)}
+                          {' · '}
+                          {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
+                          {' · '}
+                        </Text>
+                        <Text color={state} dimColor={state === undefined}>{a.status}</Text>
+                      </Text>
+                      {rest !== '' && <Text dimColor wrap="wrap">{rest}</Text>}
+                    </Box>
+                  ) : (
+                    <Text wrap="truncate-end">
+                      <Text dimColor>
+                        {a.id.slice(0, 8)}
+                        {' · '}
+                        {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
+                      </Text>
+                      {modelText.has(a.id) && <Text dimColor>{` · ${modelText.get(a.id)}`}</Text>}
+                      {effortText.has(a.id) && <Text dimColor>{` · ${effortText.get(a.id)}`}</Text>}
                       {' · '}
-                      {a.type === 'in_process_teammate' ? 'teammate' : 'subagent'}
-                      {modelText.get(a.id) ?? ''}
-                      {effortText.get(a.id) ?? ''}
-                      {' · '}
+                      <Text color={state} dimColor={state === undefined}>{a.status}</Text>
+                      {tokenText.has(a.id) && <Text dimColor>{` · ${tokenText.get(a.id)}`}</Text>}
                     </Text>
-                    <Text color={state} dimColor={state === undefined}>{a.status}</Text>
-                    {tokenText.has(a.id) && <Text dimColor>{tokenText.get(a.id)}</Text>}
-                  </Text>
+                  )}
                   {toolText.has(a.id) && (
-                    <Text color="inactive" wrap="truncate-end">
+                    <Text color="inactive" wrap={narrow ? 'wrap' : 'truncate-end'}>
                       {toolText.get(a.id)}
                     </Text>
                   )}
                   {span !== '' && (
-                    <Text dimColor wrap="truncate-end">
+                    <Text dimColor wrap={narrow ? 'wrap' : 'truncate-end'}>
                       {span}
                     </Text>
                   )}
@@ -1946,7 +1991,7 @@ export const register: Register = on => {
             </Text>
             {bg.map(t => (
               <Box key={`bg-${t.id}`} flexDirection="column">
-                <Text bold wrap="truncate-end">
+                <Text bold wrap={narrow ? 'wrap' : 'truncate-end'}>
                   {t.label}
                 </Text>
                 <Text wrap="truncate-end">
@@ -1968,35 +2013,55 @@ export const register: Register = on => {
               const span = timeline(w.startedAt, act?.workflows[w.id])
               return (
                 <Box key={w.id} flexDirection="column">
-                  <Text bold wrap="truncate-end">
+                  <Text bold wrap={narrow ? 'wrap' : 'truncate-end'}>
                     {w.title}
                   </Text>
-                  <Text wrap="truncate-end">
-                    <Text dimColor>{w.task ?? w.id} · </Text>
-                    <Text color="success">{w.agents.length} running</Text>
-                    {w.done > 0 && <Text dimColor>{` · ${w.done} done`}</Text>}
-                    {w.failed > 0 && <Text color="error">{` · ${w.failed} failed`}</Text>}
-                    {span !== '' && <Text dimColor>{` · ${span}`}</Text>}
-                  </Text>
+                  {narrow ? (
+                    <Box flexDirection="column">
+                      <Text wrap="truncate-end">
+                        <Text dimColor>{w.task ?? w.id} · </Text>
+                        <Text color="success">{w.agents.length} running</Text>
+                        {w.done > 0 && <Text dimColor>{` · ${w.done} done`}</Text>}
+                        {w.failed > 0 && <Text color="error">{` · ${w.failed} failed`}</Text>}
+                      </Text>
+                      {span !== '' && <Text dimColor wrap="wrap">{span}</Text>}
+                    </Box>
+                  ) : (
+                    <Text wrap="truncate-end">
+                      <Text dimColor>{w.task ?? w.id} · </Text>
+                      <Text color="success">{w.agents.length} running</Text>
+                      {w.done > 0 && <Text dimColor>{` · ${w.done} done`}</Text>}
+                      {w.failed > 0 && <Text color="error">{` · ${w.failed} failed`}</Text>}
+                      {span !== '' && <Text dimColor>{` · ${span}`}</Text>}
+                    </Text>
+                  )}
                   {w.agents.map((a, i) => {
                     const agentSpan = timeline(a.startedAt, a.at)
+                    const meta = [a.model, a.effort, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
+                      .filter(Boolean)
+                      .join(' · ')
                     return (
                       <Box key={`${w.id}-${i}`} flexDirection="column">
-                        <Text wrap="truncate-end">
-                          <Text dimColor>{'- '}</Text>
-                          <Text bold>{a.label}</Text>
-                          <Text dimColor>
-                            {[a.model, a.effort, a.phase, a.tokens === undefined ? '' : `${tokenCount(a.tokens)} tokens`]
-                              .filter(Boolean)
-                              .map(part => ` · ${part}`)
-                              .join('')}
+                        {narrow ? (
+                          <Box flexDirection="column">
+                            <Text wrap="wrap">
+                              <Text dimColor>{'- '}</Text>
+                              <Text bold>{a.label}</Text>
+                            </Text>
+                            {meta !== '' && <Text dimColor wrap="wrap">{meta}</Text>}
+                          </Box>
+                        ) : (
+                          <Text wrap="truncate-end">
+                            <Text dimColor>{'- '}</Text>
+                            <Text bold>{a.label}</Text>
+                            <Text dimColor>{meta === '' ? '' : ` · ${meta}`}</Text>
                           </Text>
-                        </Text>
+                        )}
                         {a.tool !== undefined && (
-                          <Text color="inactive" wrap="truncate-end">{`  ${a.tool}`}</Text>
+                          <Text color="inactive" wrap={narrow ? 'wrap' : 'truncate-end'}>{`  ${a.tool}`}</Text>
                         )}
                         {agentSpan !== '' && (
-                          <Text dimColor wrap="truncate-end">{`  ${agentSpan}`}</Text>
+                          <Text dimColor wrap={narrow ? 'wrap' : 'truncate-end'}>{`  ${agentSpan}`}</Text>
                         )}
                       </Box>
                     )
