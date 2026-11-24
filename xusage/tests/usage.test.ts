@@ -607,7 +607,7 @@ test('titles a saved workflow whose script has no run id', async () => {
       type: 'assistant',
       timestamp: agentAt.toISOString(),
       message: { model: 'claude-opus-5-5', usage: { input_tokens: 10, output_tokens: 2 } },
-    })}\n`,
+    })}\n${JSON.stringify({ type: 'api-request' })}\n`,
   )
   utimesSync(join(root, 'agent-a1.jsonl'), agentAt, agentAt)
   // A saved workflow keeps one script per definition, with no run-id suffix; the launch result names it.
@@ -736,11 +736,12 @@ test('counts only the attempts still writing as running', async () => {
   const dir = join(env.root, 'projects', '-tmp-work', session)
   const root = join(dir, 'subagents', 'workflows', 'wf_mix')
   mkdirSync(root, { recursive: true })
-  const attempt = async (agent: string, age: number) => {
+  const attempt = async (agent: string, age: number, last: Record<string, unknown>) => {
     const path = join(root, `agent-${agent}.jsonl`)
     await Bun.write(
       path,
-      `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n`,
+      `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10 } } })}\n` +
+        `${JSON.stringify(last)}\n`,
     )
     const past = new Date(Date.now() - age)
     utimesSync(path, past, past)
@@ -754,9 +755,9 @@ test('counts only the attempts still writing as running', async () => {
       JSON.stringify({ type: 'result', key: 'K-done', agentId: 'd1', result: { score: 9 } }),
     ].join('\n') + '\n',
   )
-  await attempt('l1', 60_000)
-  // Edited since its launch, so this key's old attempt never reports again while its lane moved on.
-  await attempt('q1', 3 * 60 * 60_000)
+  await attempt('l1', 60_000, { type: 'api-request' })
+  // Killed between a tool result and the next request, then silent for hours.
+  await attempt('q1', 3 * 60 * 60_000, { type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } })
   await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
   const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
   try {
@@ -764,6 +765,44 @@ test('counts only the attempts still writing as running', async () => {
     expect(rendered).toContain('1 running · 1 done')
     expect(rendered).toContain('live build')
     expect(rendered).not.toContain('quiet build')
+  } finally {
+    harness.restore()
+  }
+})
+
+test('stops counting attempts whose transcript ended its turn', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-wf-cancelled'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  const root = join(dir, 'subagents', 'workflows', 'wf_cancel')
+  mkdirSync(root, { recursive: true })
+  const final = `${JSON.stringify({
+    type: 'assistant',
+    message: { model: 'claude-opus-5', usage: { input_tokens: 10 }, content: [{ type: 'text', text: 'ok' }] },
+  })}\n`
+  await Bun.write(
+    join(root, 'journal.jsonl'),
+    [
+      JSON.stringify({ type: 'started', key: 'K-live', agentId: 'l1', label: 'live impl', phase: 'Build' }),
+      JSON.stringify({ type: 'started', key: 'K-dead', agentId: 'd1', label: 'cancelled impl', phase: 'Build' }),
+      JSON.stringify({ type: 'started', key: 'K-hook', agentId: 'h1', label: 'stopped impl', phase: 'Build' }),
+    ].join('\n') + '\n',
+  )
+  // No result line ever arrives for a cancelled key; only the transcript records how it ended.
+  await Bun.write(join(root, 'agent-l1.jsonl'), `${final}${JSON.stringify({ type: 'api-request' })}\n`)
+  await Bun.write(join(root, 'agent-d1.jsonl'), final)
+  await Bun.write(
+    join(root, 'agent-h1.jsonl'),
+    `${final}${JSON.stringify({ type: 'attachment', attachment: { type: 'hook_success', hookEvent: 'SubagentStop' } })}\n`,
+  )
+  await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
+  const harness = await paneHarness(env, { session, now: () => Date.now(), alive: [] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('1 running')
+    expect(rendered).toContain('live impl')
+    expect(rendered).not.toContain('cancelled impl')
+    expect(rendered).not.toContain('stopped impl')
   } finally {
     harness.restore()
   }
@@ -969,7 +1008,8 @@ test('stacks a workflow entry on a narrow terminal instead of truncating it', as
   const agent = join(root, 'agent-a1.jsonl')
   await Bun.write(
     agent,
-    `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 2 } } })}\n`,
+    `${JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 2 } } })}\n` +
+      `${JSON.stringify({ type: 'api-request' })}\n`,
   )
   utimesSync(agent, past, past)
   mkdirSync(join(dir, 'workflows', 'scripts'), { recursive: true })
@@ -1037,7 +1077,7 @@ test('keeps last-known-good rows when a pane read fails', async () => {
       type: 'assistant',
       timestamp: new Date(env.now() - 60_000).toISOString(),
       message: { model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 2 } },
-    })}\n`,
+    })}\n${JSON.stringify({ type: 'api-request' })}\n`,
   )
   await Bun.write(`${dir}.jsonl`, `${JSON.stringify({ type: 'user', message: { content: [] } })}\n`)
   let failScan = false

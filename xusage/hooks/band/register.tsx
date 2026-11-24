@@ -645,9 +645,8 @@ const progress = (w: WorkflowRun) =>
 // shortcut: a silent run stays listed for that day even if its engine died; a single tool call can be silent for
 // hours, so silence cannot tell a live run from a dead one.
 const WF_KEEP_MS = 24 * 60 * 60_000
-// The run row waits a day, but a key whose latest attempt has written nothing for this long is not running: the
-// host retries it as a fresh line in the journal, and a script edited since the launch leaves its old keys behind
-// for good. The host's own count lists only the attempts it is running now.
+// The run row waits a day, but a key whose latest attempt has written nothing for this long is not running. A
+// cancelled attempt is caught earlier by its transcript's end marker; this bounds the ones that died mid-turn.
 const WF_QUIET_MS = 30 * 60_000
 let workflows: { at: number; list: WorkflowRun[] } | undefined
 let sessionDirCache: { session: string; dir: string } | undefined
@@ -972,6 +971,7 @@ async function runningWorkflows($: EngineInterface): Promise<WorkflowRun[]> {
       const at = path === undefined ? 0 : await mtime($, path)
       if (at > 0 && now - at > WF_QUIET_MS) continue
       const usage = path === undefined ? undefined : await agentUsage($, path)
+      if (usage?.stopped === true) continue
       agents.push({
         ...a,
         model: usage?.model ?? '',
@@ -1025,9 +1025,9 @@ async function transcriptTime($: EngineInterface, path: string): Promise<number>
 async function agentUsage(
   $: EngineInterface,
   path: string,
-): Promise<{ model: string; tokens: number | undefined; effort: string }> {
+): Promise<{ model: string; tokens: number | undefined; effort: string; stopped: boolean }> {
   const out = await tailText($, path)
-  if (out === undefined) return { model: '', tokens: undefined, effort: '' }
+  if (out === undefined) return { model: '', tokens: undefined, effort: '', stopped: false }
   const lines = out.split('\n')
   let model: string | undefined
   let tokens: number | undefined
@@ -1053,7 +1053,28 @@ async function agentUsage(
       // the window may start mid-line
     }
   }
-  return { model: model ?? '', tokens, effort: effort ?? '' }
+  return { model: model ?? '', tokens, effort: effort ?? '', stopped: tailStopped(lines) }
+}
+
+// A cancelled attempt stops writing on the model's last answer or its Stop hook, and its key never gets a result
+// line; a live one waits on a model request or a running tool. Only the transcript tells the two apart.
+function tailStopped(lines: string[]): boolean {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (!lines[i].startsWith('{')) continue
+    let record: any
+    try {
+      record = JSON.parse(lines[i])
+    } catch {
+      // the last line may still be mid-write
+      continue
+    }
+    if (record?.type === 'assistant') {
+      const content = record.message?.content
+      return !(Array.isArray(content) && content.some((part: any) => part?.type === 'tool_use'))
+    }
+    return record?.attachment?.hookEvent === 'SubagentStop'
+  }
+  return false
 }
 
 // The tool an agent started last, finished or not: most tools are shorter than the pane's refresh, so an
