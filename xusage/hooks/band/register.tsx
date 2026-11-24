@@ -1844,17 +1844,18 @@ export const register: Register = on => {
       // No width: the band stretches the row; the tiers pick the layout, they do not size it.
       narrow ? (
         <Box flexDirection="column">
-          <Box flexDirection="row" gap={2} alignItems="center">{head}</Box>
+          {/* Wrap whole items onto the next line: squeezed Text breaks mid-word, a wrapped row keeps plan, windows and context intact. */}
+          <Box flexDirection="row" columnGap={2} alignItems="center" flexWrap="wrap">{head}</Box>
           {(badgeButton !== null || trailing !== '') && (
-            <Box flexDirection="row" justifyContent={badgeButton !== null ? 'space-between' : 'flex-end'} alignItems="center">
+            <Box flexDirection="row" columnGap={2} flexWrap="wrap" justifyContent={badgeButton !== null ? 'space-between' : 'flex-end'} alignItems="center">
               {badgeButton}
               {trailing !== '' && <Text dimColor>{trailing}</Text>}
             </Box>
           )}
         </Box>
       ) : (
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Box flexDirection="row" gap={2} alignItems="center">
+        <Box flexDirection="row" columnGap={2} flexWrap="wrap" justifyContent="space-between" alignItems="center">
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap" alignItems="center">
             {head}
             {badgeButton}
           </Box>

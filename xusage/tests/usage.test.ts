@@ -912,6 +912,10 @@ test('stacks the band on a narrow terminal and drops the conversation name in th
   try {
     const wide = await harness.renderBand(120)
     expect(wide.props.flexDirection).toBe('row')
+    // Items wrap whole instead of being squeezed mid-word when the row runs out of cells.
+    expect(wide.props.flexWrap).toBe('wrap')
+    expect(wide.children[0].props.flexWrap).toBe('wrap')
+    expect(wide.children[0].props.columnGap).toBe(2)
     expect(paneText(wide)).toContain('band-tiers')
     const mid = await harness.renderBand(84)
     expect(mid.props.flexDirection).toBe('row')
@@ -920,6 +924,9 @@ test('stacks the band on a narrow terminal and drops the conversation name in th
     // Two rows: the plan and its windows above, the counts and the conversation below.
     expect(narrow.props.flexDirection).toBe('column')
     expect(narrow.children.length).toBe(2)
+    expect(narrow.children[0].props.flexWrap).toBe('wrap')
+    expect(narrow.children[0].props.columnGap).toBe(2)
+    expect(narrow.children[1].props.flexWrap).toBe('wrap')
     expect(paneText(narrow)).toContain('1 wf')
     expect(paneText(narrow)).toContain('band-tiers')
   } finally {
