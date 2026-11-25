@@ -1203,9 +1203,12 @@ const BG_PROBE_MAX = 64
 // transcript never arrives. Reading that many host-sized windows back from the end stays under the cap.
 const BG_BACKFILL_WINDOWS = 16
 const BG_ANCHOR =
-  '"run_in_background":true|Command running in background with ID:|was moved to the background|<task-id>|"name":"TaskStop"'
+  '"run_in_background":true|Command running in background with ID:|was moved to the background|manually backgrounded|<task-id>|"name":"TaskStop"'
 const BG_LAUNCH =
   /Command running in background with ID: ([A-Za-z0-9]+)\. Output is being written to: ([\s\S]+?)\. You will be notified/
+// Ctrl+B sets a foreground command aside without interrupting it, and the result has no completion sentence.
+const BG_MANUAL =
+  /Command was manually backgrounded by user with ID: ([A-Za-z0-9]+)\. Output is being written to: ([^\n]+?)\.(?:\s|$)/
 // A foreground command the host gives up on is backgrounded after a timeout; the tool_use carries no
 // run_in_background flag and can be many minutes older than this result.
 const BG_TIMEOUT =
@@ -1245,6 +1248,7 @@ function bgParse(text: string, state: BgState) {
       !line.includes('run_in_background') &&
       !line.includes('Command running in background with ID:') &&
       !line.includes('was moved to the background') &&
+      !line.includes('manually backgrounded') &&
       !line.includes('<task-id>') &&
       !line.includes('TaskStop') &&
       !line.includes('"name":"Bash"') &&
@@ -1294,10 +1298,11 @@ function bgParse(text: string, state: BgState) {
             .replace(BG_TIMEOUT, 'Command running in background with ID: $1.'),
         )
         const mcp = BG_MCP.exec(body)
+        const manual = BG_MANUAL.exec(body)
         const tool = typeof block.tool_use_id === 'string' ? state.tools.get(block.tool_use_id) : undefined
         if (typeof block.tool_use_id === 'string') state.tools.delete(block.tool_use_id)
-        if (hit === null && mcp === null) continue
-        const id = hit?.[1] ?? mcp![2]
+        if (hit === null && mcp === null && manual === null) continue
+        const id = hit?.[1] ?? mcp?.[2] ?? manual![1]
         if (state.closed.has(id) || state.open.has(id)) continue
         const started = tool !== undefined && tool.at > 0
           ? tool.at
@@ -1305,7 +1310,7 @@ function bgParse(text: string, state: BgState) {
         state.open.set(id, {
           id,
           label: mcp?.[1].trim() || tool?.label.trim() || tool?.command.split('\n')[0].trim() || id,
-          path: hit?.[2] ?? '',
+          path: hit?.[2] ?? manual?.[2] ?? '',
           startedAt: Number.isNaN(started) ? 0 : started,
           at: 0,
         })

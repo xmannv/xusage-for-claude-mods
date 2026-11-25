@@ -1725,6 +1725,59 @@ test('finds background tasks under the resumed conversation id', async () => {
   }
 })
 
+test('finds a command the user backgrounded by hand', async () => {
+  const env = engine(async () => ok(12))
+  const session = 'sess-bg-manual'
+  const dir = join(env.root, 'projects', '-tmp-work', session)
+  mkdirSync(dir, { recursive: true })
+  const tasks = join(env.root, 'bg-manual')
+  mkdirSync(tasks, { recursive: true })
+  const boot = Date.now()
+  const now = boot + 30_000
+  const output = join(tasks, 'bmanual1.output')
+  await Bun.write(output, 'out')
+  utimesSync(output, new Date(now), new Date(now))
+  await Bun.write(
+    `${dir}.jsonl`,
+    [
+      JSON.stringify({ type: 'user', message: { content: [] } }),
+      // Ctrl+B: the tool_use asked for no background flag, the result is the only launch record.
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: new Date(boot).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'tu1',
+            name: 'Bash',
+            input: { command: 'bash wait-load.sh', description: 'Wait for load1 below 9' },
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date(boot + 1_000).toISOString(),
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tu1',
+            content: `Command was manually backgrounded by user with ID: bmanual1. Output is being written to: ${output}.`,
+          }],
+        },
+      }),
+    ].join('\n') + '\n',
+  )
+  const harness = await paneHarness(env, { session, now: () => now, alive: [output] })
+  try {
+    const rendered = paneText(await harness.render())
+    expect(rendered).toContain('Background (1)')
+    expect(rendered).toContain('Wait for load1 below 9')
+    expect(rendered).toContain('bmanual1 · started: 30s · activity: now · running')
+  } finally {
+    harness.restore()
+  }
+})
+
 test('ignores a title stub at the runtime session id', async () => {
   const env = engine(async () => ok(12))
   const runtime = 'runtime-stub'

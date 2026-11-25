@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "xusage",
-  "version": "0.3.35",
+  "version": "0.3.36",
   "description": "Band above the prompt showing plan usage and quota reset times.",
   "author": {
     "name": "Xman",
