@@ -2318,3 +2318,113 @@ test('keeps plan, agents and activity when usage fails with nothing cached', asy
     globalThis.setInterval = originalSetInterval
   }
 })
+
+test('one click on the band toggles ultracode and back', async () => {
+  const { register } = await loadModule()
+  const env = engine(async () => ok(10))
+  const transcript = join(env.root, 'projects', '-tmp-work', 's1.jsonl')
+  mkdirSync(join(env.root, 'projects', '-tmp-work'), { recursive: true })
+  const write = async (entry: Record<string, unknown>) => {
+    const before = await Bun.file(transcript).text().catch(() => '')
+    await Bun.write(transcript, `${before}${JSON.stringify(entry)}\n`)
+  }
+  await write({
+    type: 'assistant',
+    perTurnEffort: 'medium',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'ready' }] },
+    timestamp: new Date(env.now()).toISOString(),
+    sessionId: 's1',
+  })
+  let render: any
+  const registration = { catch: () => registration }
+  register((event: string, filter: any, handler: any) => {
+    if (filter.component === 'AbovePrompt') render = handler
+    return registration
+  })
+  const sent: string[] = []
+  const $: any = {
+    ...env.$,
+    agent: { list: async () => [] },
+    fs: { ...env.$.fs, list: async () => [] },
+    session: {
+      id: async () => 's1',
+      model: async () => 'qoder/dfmodel',
+      root: async () => '/tmp/work',
+      cwd: async () => '/tmp/work',
+      usage: async () => ({ context: { tokens: 42_000, window: 258_000 } }),
+    },
+    ui: {
+      resolve: () => ({ Box: 'Box', Text: 'Text', Button: 'Button' }),
+      invalidate: async () => undefined,
+      status: async () => undefined,
+    },
+    command: {
+      run: async (e: any) => {
+        sent.push(`/${e.command} ${e.args}`.trim())
+        await write({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: `<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>${e.args}</command-args>`,
+          },
+          timestamp: new Date(env.now()).toISOString(),
+          sessionId: 's1',
+        })
+        await write({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: e.args === 'ultracode on'
+              ? '<local-command-stdout>Ultracode on (this session only): dynamic workflows on every task. Effort stays medium.</local-command-stdout>'
+              : '<local-command-stdout>Ultracode off. Effort stays medium.</local-command-stdout>',
+          },
+          timestamp: new Date(env.now()).toISOString(),
+          sessionId: 's1',
+        })
+        return { text: '' }
+      },
+    },
+  }
+  const originalH = globalThis.h
+  const originalSetInterval = globalThis.setInterval
+  globalThis.h = ((type: any, props: any, ...children: any[]) => ({ type, props, children })) as any
+  globalThis.setInterval = (() => 1) as any
+  const text = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(text).join('')
+    return text(node.children ?? node.props?.children)
+  }
+  const press = (node: any, key: string): (() => Promise<void>) | undefined => {
+    if (node == null || typeof node !== 'object') return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = press(child, key)
+        if (found !== undefined) return found
+      }
+      return undefined
+    }
+    if (node.type === 'Button' && node.props?.key === key) return node.props.onPress
+    return press(node.children, key)
+  }
+
+  try {
+    const band = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(band)).toContain('uc off')
+    await press(band, 'ultra')!()
+    expect(sent).toEqual(['/effort ultracode on'])
+    const on = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(on)).toContain('uc on')
+    await press(on, 'ultra')!()
+    expect(sent).toEqual(['/effort ultracode on', '/effort ultracode off'])
+    const off = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(off)).toContain('uc off')
+    // The transcript, not the click override, must keep the label right afterwards.
+    env.advance(6_000)
+    const after = await render($, { props: { hasSurvey: false, bodyColumns: 80 } }, async () => undefined)
+    expect(text(after)).toContain('uc off')
+  } finally {
+    globalThis.h = originalH
+    globalThis.setInterval = originalSetInterval
+  }
+})

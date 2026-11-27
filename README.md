@@ -37,6 +37,10 @@ Claude Code's built-in agent UI does not cover background work well:
 - **Running workflows** — the title comes from the workflow script's own description; the id is the **task id the conversation uses** (e.g. `wft7bs6ek`) when its launch result is found, otherwise the internal run id. Each run shows its progress, start time and last activity, and each agent currently running inside it shows its label, model, phase, tokens, start time and last activity, read from that agent's own transcript.
 - **Activity age** — the band always shows when the conversation last did something, using the newest transcript, agent or workflow file, so a conversation that looks idle but has background agents running is visibly alive.
 
+### Ultracode
+
+- **Chip** — `uc on` / `uc off` in the band. A click runs `/effort ultracode on` or `/effort ultracode off` and leaves the effort level alone. The label follows `/effort` commands typed in the session, which the band reads from the transcript; ultracode is session-only, so state from a previous process is ignored.
+
 **Agents pane** — opened by clicking the `N wf · M agents` badge.
 
 ![Agents pane](assets/side-panel.png)
@@ -105,7 +109,7 @@ Proxy database defaults:
 
 - **Claude account** — `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from the macOS Keychain or `$CLAUDE_CONFIG_DIR/.credentials.json`. The plan comes from `subscriptionType` + `rateLimitTier`.
 - **Local proxy** — the newest EasyCLIProxyAPI usage record, which carries the upstream quota headers (`X-Codex-*`). The band reads it with `sqlite3`.
-- **Agents and workflows** — Claude Code does not expose workflows through the plugin API, so the band reads the session's own files under `$CLAUDE_CONFIG_DIR/projects/<project>/<session>/`: `subagents/agent-*.jsonl` (+ `.meta.json`), `subagents/workflows/<run>/journal.jsonl`, `subagents/workflows/<run>/agent-*.jsonl`, `workflows/<run>.json`, `workflows/scripts/*.js` and the session transcript `<session>.jsonl` (for task ids).
+- **Agents and workflows** — Claude Code does not expose workflows through the plugin API, so the band reads the session's own files under `$CLAUDE_CONFIG_DIR/projects/<project>/<session>/`: `subagents/agent-*.jsonl` (+ `.meta.json`), `subagents/workflows/<run>/journal.jsonl`, `subagents/workflows/<run>/agent-*.jsonl`, `workflows/<run>.json`, `workflows/scripts/*.js` and the session transcript `<session>.jsonl` (for task ids and the `/effort` state behind the `uc` chip).
 
 Usage is cached across all Claude Code windows through a lock file, so simultaneous windows make one request instead of one each. A `429` without `Retry-After` backs off 5 minutes; a valid `Retry-After` (seconds or HTTP date) is honored, capped at 1 hour.
 

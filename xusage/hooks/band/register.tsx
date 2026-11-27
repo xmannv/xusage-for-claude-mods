@@ -1732,6 +1732,84 @@ async function compactSettings($: EngineInterface): Promise<any> {
   return Object.assign({}, ...layers.filter(Boolean))
 }
 
+// The plugin API exposes no ultracode state, so the session transcript is the source of truth: /effort
+// commands and their output. Ultracode is session-only, so a transition older than the running process
+// belongs to a previous session and must not light the chip.
+type UltraScan = { path: string; size: number; mtimeMs: number; at: number; on: boolean | undefined }
+let ultraScan: UltraScan | undefined
+let ultraOverride: { session: string; until: number; on: boolean } | undefined
+const ULTRA_SCAN_MS = 3_000
+const ULTRA_OVERRIDE_MS = 5_000
+const EFFORT_LEVELS = new Set(['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'off'])
+
+async function transcriptUltra($: EngineInterface, dir: string): Promise<boolean | undefined> {
+  const path = `${dir}.jsonl`
+  const now = await $.clock.now().catch(() => Date.now())
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat === undefined) return undefined
+  const held = ultraScan?.path === path ? ultraScan : undefined
+  if (held !== undefined) {
+    if (held.size === stat.size && held.mtimeMs === stat.mtimeMs) return held.on
+    // A turn rewrites the transcript constantly; this window is enough to spot an /effort the person typed.
+    if (now - held.at < ULTRA_SCAN_MS) return held.on
+  }
+  const text = await tailText($, path)
+  if (text === undefined) return held?.on
+  const start = (await engineSession($).catch(() => undefined))?.at ?? 0
+  let on = held?.on
+  for (const line of text.split('\n')) {
+    if (!line.includes('/effort') && !line.includes('Ultracode')) continue
+    let record: any
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const stamp = typeof record?.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN
+    if (start > 0 && Number.isFinite(stamp) && stamp < start) continue
+    const content = record?.message?.content
+    if (typeof content !== 'string') continue
+    if (content.includes('<command-name>/effort</command-name>')) {
+      const hit = /<command-args>([\s\S]*?)<\/command-args>/.exec(content)
+      const args = hit === null ? '' : hit[1].trim().toLowerCase()
+      const [name, option, ...extra] = args.split(/\s+/)
+      if (args === '' || extra.length > 0) continue
+      if (name === 'ultracode') {
+        if (option === undefined || option === 'on') on = true
+        else if (option === 'off') on = false
+      } else if (option === undefined && EFFORT_LEVELS.has(name)) {
+        // Setting a level also turns ultracode off; the output says so when it was on.
+        on = false
+      }
+      continue
+    }
+    if (content.includes('<local-command-stdout>')) {
+      if (/ultracode on/i.test(content)) on = true
+      else if (/ultracode off/i.test(content)) on = false
+    }
+  }
+  ultraScan = { path, size: stat.size, mtimeMs: stat.mtimeMs, at: now, on }
+  return on
+}
+
+async function ultraMode($: EngineInterface): Promise<boolean> {
+  const now = await $.clock.now().catch(() => Date.now())
+  const session = await $.session.id().catch(() => '')
+  if (ultraOverride !== undefined && ultraOverride.session === session && now < ultraOverride.until) {
+    return ultraOverride.on
+  }
+  const settings = await compactSettings($)
+  const dir = await sessionDir($).catch(() => '')
+  const seen = dir === '' ? undefined : await transcriptUltra($, dir).catch(() => undefined)
+  return seen ?? settings?.ultracode === true
+}
+
+async function setUltra($: EngineInterface, active: boolean): Promise<void> {
+  const session = await $.session.id().catch(() => '')
+  const now = await $.clock.now().catch(() => Date.now())
+  ultraOverride = { session, until: now + ULTRA_OVERRIDE_MS, on: active }
+}
+
 export const register: Register = on => {
   let ticker: ReturnType<typeof setInterval> | undefined
   let beat: ReturnType<typeof setInterval> | undefined
@@ -1778,6 +1856,19 @@ export const register: Register = on => {
       : ''
     const compact = contextLabel === '' ? { text: '' } : await compactInfo($, context.window)
     const contextText = `${contextLabel}${compact.text}`
+    const ultraOn = await ultraMode($).catch(() => undefined)
+    const toggleUltra = async () => {
+      const active = await ultraMode($).catch(() => undefined)
+      if (active === undefined) return
+      const level = active ? 'ultracode off' : 'ultracode on'
+      const ran = await $.command.run({ command: 'effort', args: level }).catch(() => undefined)
+      if (ran === undefined) {
+        $.ui.status('ultracode: /effort failed')
+        return
+      }
+      await setUltra($, !active).catch(() => undefined)
+      await $.ui.invalidate('ui.render').catch(() => undefined)
+    }
     // The auto-compact window is the real pressure point, unlike the 70/90 quota thresholds.
     const contextHot = typeof context?.tokens === 'number' && compact.at !== undefined && context.tokens >= compact.at
     const agentRows = await liveAgents($).catch(() => [])
@@ -1851,6 +1942,11 @@ export const register: Register = on => {
       ...(contextText === ''
         ? []
         : [<Text key="context" dimColor={!contextHot} color={contextHot ? 'warning' : undefined}>{contextText}</Text>]),
+      <Button key="ultra" plain onPress={toggleUltra}>
+        <Text bold color={ultraOn === true ? 'suggestion' : undefined} dimColor={ultraOn !== true}>
+          {ultraOn === true ? 'uc on' : 'uc off'}
+        </Text>
+      </Button>,
     ]
     const badgeButton = badge !== '' || bgStale > 0
       ? (
